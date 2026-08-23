@@ -47,6 +47,10 @@ export {
 } from './lib/convert/codex.mjs'
 
 export {
+  convertCodebuddyJsonl,
+} from './lib/convert/codebuddy.mjs'
+
+export {
   convertChatgptJson,
 } from './lib/convert/chatgpt.mjs'
 

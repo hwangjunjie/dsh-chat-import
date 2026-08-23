@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { convertClaudeJsonl, convertCodexJsonl, convertChatgptJson, convertCursorJsonl, convertGeminiJson, convertReasonixJsonl, convertPiJsonl, convertOpencodeJson, reasonixStemTime, mintSessionId, parseTime, SESSION_FORMAT_VERSION, tailSessionEvents, codexCustomToolArguments, jsObjectLiteralToJson, estimateTokens, cropContentBlocks, trimTurns, applyBudgetTrim, TEXT_BLOCK_CHAR_LIMIT, TOOL_RESULT_CHAR_LIMIT, validateSessionEvents } from '../convert.mjs'
+import { convertClaudeJsonl, convertCodexJsonl, convertCodebuddyJsonl, convertChatgptJson, convertCursorJsonl, convertGeminiJson, convertReasonixJsonl, convertPiJsonl, convertOpencodeJson, reasonixStemTime, mintSessionId, parseTime, SESSION_FORMAT_VERSION, tailSessionEvents, codexCustomToolArguments, jsObjectLiteralToJson, estimateTokens, cropContentBlocks, trimTurns, applyBudgetTrim, TEXT_BLOCK_CHAR_LIMIT, TOOL_RESULT_CHAR_LIMIT, validateSessionEvents } from '../convert.mjs'
 import { pinSourcedSessionTitle } from '../lib/sourced-title.mjs'
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), 'fixtures')
@@ -641,6 +641,73 @@ test('convertCodexJsonl: 子代理 rollout 跳过（issue #17），fork 会话�
   assert.ok(fork.meta)
   assert.equal(fork.turns.length, 1)
   assert.equal(fork.meta.sourceId, 'fork-1')
+})
+
+// ---- CodeBuddy (Tencent AI Code) JSONL ----
+test('convertCodebuddyJsonl: 简单问答合成平衡回合（sessionId/cwd 取自事件级字段）', () => {
+  const out = convertCodebuddyJsonl(load('codebuddy-simple.jsonl'), { sourcePath: '/demo/codebuddy/simple.jsonl' })
+  assert.equal(out.turns.length, 1)
+  assert.equal(out.messages, 2)
+  assert.equal(out.toolCalls, 0)
+  assert.equal(out.meta.id, 'import-abc123-simple')
+  assert.equal(out.meta.sourceId, 'abc123-simple')
+  assert.equal(out.meta.version, SESSION_FORMAT_VERSION)
+  assert.equal(out.meta.cwd, '/demo/codebuddy-proj')
+  assert.ok(out.meta.createdAt)
+  // 标题：topic 钉 session/title 事件（导入历史会话列表标题不能依赖自动回退）
+  assert.equal(out.title, '初始问候')
+  const titleEv = out.events.find((e) => e.type === 'session/title')
+  assert.ok(titleEv, 'session/title 事件已钉住')
+  assert.equal(titleEv.data.title, '初始问候')
+
+  const types = out.events.map((e) => e.type)
+  assert.deepEqual(types, [
+    'user/message', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end', 'session/title',
+  ])
+  // seq 连续从 0 开始；事件以 turn/end 平衡收尾（session/title 钉在最后，不破坏回合平衡）
+  out.events.forEach((e, i) => assert.equal(e.seq, i))
+  assert.equal([...types].reverse().find((t) => t !== 'session/title'), 'turn/end')
+  // 导入归属外置 registry（issue #34）：0.8.3 起日志不再写 session/imported 标记
+  assert.ok(out.events.every((e) => e.type !== 'session/imported'), '日志不得含 session/imported 标记')
+  // surface 事件带 surfaceOp
+  for (const e of out.events.filter((e) => e.type === 'user/message' || e.type === 'assistant/message')) {
+    assert.equal(e.surfaceOp, 'append')
+  }
+  // assistant 的 source 带 codebuddy provider 与真实 model
+  const asst = out.events.find((e) => e.type === 'assistant/message').data.message
+  assert.deepEqual(asst.source, { kind: 'model', provider: 'codebuddy', model: 'glm-5.0-turbo' })
+})
+
+test('convertCodebuddyJsonl: function_call + function_call_result 按 callId 跨行配对', () => {
+  const out = convertCodebuddyJsonl(load('codebuddy-tool.jsonl'))
+  assert.equal(out.turns.length, 1)
+  assert.equal(out.toolCalls, 1)
+  assert.equal(out.messages, 3) // user + assistant（含 tool-call block）+ tool/result
+  const types = out.events.map((e) => e.type)
+  assert.ok(types.includes('tool/call'))
+  assert.ok(types.includes('tool/result'))
+  // 事件以 turn/end 平衡收尾（session/title 钉在最后）
+  assert.equal([...types].reverse().find((t) => t !== 'session/title'), 'turn/end')
+
+  const call = out.events.find((e) => e.type === 'tool/call')
+  assert.equal(call.data.callId, 'call_001')
+  assert.equal(call.data.name, 'Bash')
+  assert.equal(call.data.arguments, '{"command":"hostname","description":"Check current hostname"}')
+
+  const result = out.events.find((e) => e.type === 'tool/result')
+  assert.equal(result.data.message.content[0].toolCallId, 'call_001')
+  assert.deepEqual(result.sourceEventSeqs, [call.seq])
+  assert.equal(result.surfaceOp, 'append')
+  // output 是 {type:'text',text} 结构，直接作为 text block
+  assert.ok(result.data.message.content[0].content[0].text.includes('zzzhdeMac-mini.local'))
+  assertMessageOrderLegal(out.events)
+})
+
+test('convertCodebuddyJsonl: summary 作标题兜底、无 topic 时不失败', () => {
+  const out = convertCodebuddyJsonl(load('codebuddy-tool.jsonl'))
+  // tool fixture 无 topic，summary 兜底
+  assert.equal(out.title, '主机名查询会话')
+  assert.equal(out.events.find((e) => e.type === 'session/title').data.title, '主机名查询会话')
 })
 
 // ---- REQ-44: codex custom_tool_call JS 参数 → 标准 JSON（保真度） ----

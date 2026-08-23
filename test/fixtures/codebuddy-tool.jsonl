@@ -1,0 +1,5 @@
+{"id":"u1","timestamp":1774068887000,"type":"message","role":"user","content":[{"type":"input_text","text":"查一下主机名"}],"providerData":{"agent":"cli"},"sessionId":"abc124-tool","cwd":"/demo"}
+{"id":"a1","parentId":"u1","timestamp":1774068887100,"type":"message","role":"assistant","status":"completed","content":[],"providerData":{"model":"glm-5.0-turbo","agent":"cli"},"sessionId":"abc124-tool","cwd":"/demo"}
+{"id":"c1","parentId":"a1","timestamp":1774068887297,"type":"function_call","callId":"call_001","name":"Bash","arguments":"{\"command\":\"hostname\",\"description\":\"Check current hostname\"}","providerData":{"extra_fields":null,"reasoning":"plan"},"sessionId":"abc124-tool","cwd":"/demo"}
+{"id":"r1","parentId":"c1","timestamp":1774068987578,"type":"function_call_result","name":"Bash","callId":"call_001","status":"completed","output":{"type":"text","text":"Command: hostname\nStdout: zzzhdeMac-mini.local\nExit Code: 0"},"providerData":{"agent":"cli"},"sessionId":"abc124-tool","cwd":"/demo"}
+{"timestamp":1774068887300,"type":"summary","summary":"主机名查询会话"}

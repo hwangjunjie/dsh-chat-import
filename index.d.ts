@@ -72,7 +72,7 @@ export interface ImportOptions {
 }
 
 export type LocalJsonlFormat =
-  | 'dsh' | 'claude' | 'codex' | 'cursor' | 'reasonix' | 'pi' | 'openclaw' | 'hermes' | 'qoder'
+  | 'dsh' | 'claude' | 'codex' | 'codebuddy' | 'cursor' | 'reasonix' | 'pi' | 'openclaw' | 'hermes' | 'qoder'
 
 /** import_chat 的源格式枚举（值 = 来源短名，与面板来源 / discovery FORMATS 一致）。 */
 export type ChatFormat =
