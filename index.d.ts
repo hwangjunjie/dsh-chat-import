@@ -34,6 +34,7 @@ export declare function exportClaudeSession(
 export interface ToolSurface {
   import_claude(options: ImportOptions): Promise<ImportResult>
   import_codex(options: ImportOptions): Promise<ImportResult>
+  import_codebuddy(options: ImportOptions): Promise<ImportResult>
   import_chatgpt(options: ImportOptions & { branch?: 'main' | 'all' }): Promise<ImportResult>
   import_cursor(options: ImportOptions): Promise<ImportResult>
   import_gemini(options: ImportOptions): Promise<ImportResult>
@@ -94,7 +95,7 @@ export interface ZcodeExtraParams {
 }
 
 export type LocalJsonlFormat =
-  | 'dsh' | 'claude' | 'codex' | 'cursor' | 'reasonix' | 'pi' | 'openclaw' | 'hermes' | 'qoder'
+  | 'dsh' | 'claude' | 'codex' | 'codebuddy' | 'cursor' | 'reasonix' | 'pi' | 'openclaw' | 'hermes' | 'qoder'
 
 export type ImportStatus = 'imported' | 'already-imported' | 'appended' | 'skipped' | 'failed'
 

@@ -35,7 +35,7 @@
 
 ## 💡 Intro
 
-`dsh-chat-import` imports conversation histories from **Claude Code, Codex, ChatGPT, Cursor, Gemini, Reasonix, opencode, MiMo Code, ZCode, Grok Build, OpenClaw, Pi Coding Agent, Hermes, Kimi CLI / Kimi Code, Qoder CLI and DSH session logs** — tool calls, reasoning and all — as **full-fidelity, resumable DeepSeek Harness sessions**. Source files are read **read-only** (never rewritten), the DSH engine is never touched, and every import becomes a fresh session grouped into the workspace of its source `cwd`.
+`dsh-chat-import` imports conversation histories from **Claude Code, Codex, CodeBuddy, ChatGPT, Cursor, Gemini, Reasonix, opencode, MiMo Code, ZCode, Grok Build, OpenClaw, Pi Coding Agent, Hermes, Kimi CLI / Kimi Code, Qoder CLI and DSH session logs** — tool calls, reasoning and all — as **full-fidelity, resumable DeepSeek Harness sessions**. Source files are read **read-only** (never rewritten), the DSH engine is never touched, and every import becomes a fresh session grouped into the workspace of its source `cwd`.
 
 The reverse direction is covered too: `export_claude` serializes a DSH session back into a Claude Code JSONL transcript that Claude Code can load with `--resume` (read-only — your DSH log is never modified), `sync_to_claude` incrementally appends a session's new turns back to a Claude Code file — guarded, never silently overwriting — and the same matrix extends to **Codex rollouts** (`export_codex`) and **Kimi wire files** (`export_kimi`), plus a **portable interchange bundle** (`export_bundle` / `restore_bundle`) with SHA-256 fingerprints and cross-machine restore.
 

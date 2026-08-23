@@ -46,3 +46,12 @@ test('import_local_jsonl 自动识别 Qoder CLI transcript', async () => {
   assert.equal(out.title, '示例会话')
   assert.equal(out.turns.length, 1)
 })
+
+test('import_local_jsonl 自动识别 CodeBuddy transcript', async () => {
+  const raw = await readFile(new URL('./fixtures/codebuddy-simple.jsonl', import.meta.url), 'utf8')
+  const out = convertLocalJsonl(raw, { sourcePath: '/Users/u/.codebuddy/projects/Users-u/codebuddy-simple.jsonl' })
+  assert.equal(out.detectedFormat, 'codebuddy')
+  assert.equal(out.meta.id, 'import-abc123-simple')
+  assert.equal(out.title, '初始问候')
+  assert.equal(out.turns.length, 1)
+})

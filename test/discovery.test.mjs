@@ -645,9 +645,9 @@ test('isInjectedTitle / normalizeTitle / layoutProject 纯函数', () => {
   assert.equal(layoutProject('/home/u/.cursor/projects/slug-c/agent-transcripts/abc/abc.jsonl', 'cursor'), 'slug-c')
 })
 
-test('FORMATS 与工具 schema enum 一致（16 种）', () => {
-  assert.equal(FORMATS.length, 16)
-  assert.deepEqual([...FORMATS].sort(), ['chatgpt', 'claude', 'codex', 'cursor', 'dsh', 'gemini', 'grokbuild', 'hermes', 'kimi', 'mimocode', 'openclaw', 'opencode', 'pi', 'qoder', 'reasonix', 'zcode'])
+test('FORMATS 与工具 schema enum 一致（17 种）', () => {
+  assert.equal(FORMATS.length, 17)
+  assert.deepEqual([...FORMATS].sort(), ['chatgpt', 'claude', 'codebuddy', 'codex', 'cursor', 'dsh', 'gemini', 'grokbuild', 'hermes', 'kimi', 'mimocode', 'openclaw', 'opencode', 'pi', 'qoder', 'reasonix', 'zcode'])
 })
 
 // ── git 状态（REQ-58）──────────────────────────────────────────────────────
