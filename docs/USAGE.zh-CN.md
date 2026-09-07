@@ -4,6 +4,11 @@
 
 ## 🛠 使用
 
+> **首次迁移分步流程**（与 [dsh-movein 首次迁移指南](https://github.com/sjh9714/dsh-movein/blob/main/docs/first-migration.zh.md) 的叙事对齐；其管配置，本插件管会话历史，可按需只用其一）：
+> ① **预览** - `scan_discover()` 或侧边栏面板查看可导入会话与导入状态徽标；或任一 `import_*` 传 `preview: true` 零副作用试跑。
+> ② **导入** - 去掉 `preview` 正式导入，按来源 / 工作区核对逐会话 `status`（重复导入行为见下文「增量续写」）。
+> ③ **体检与撤回** - `doctor()` 只读体检；`retract_import` 撤回 registry 记录，或面板「历史」页删除本插件创建的会话（需确认）。
+
 > **注意**：导入会即时落盘，但 DSH 的会话列表不会自动刷新——导入后请刷新页面（或会话列表）才能看到新会话。
 
 **导入——单个文件或目录。** 每个 `import_*` 工具都接受 `path`；目录递归扫描，每个文件 / 每段对话成为独立会话：
@@ -13,6 +18,7 @@ import_claude({ path: "C:\Users\<you>\.claude\projects\<slug>\<sessionId>.jsonl"
 import_codex({ path: "C:\Users\<you>\.codex\sessions\2026\05\18\rollout-2026-05-18T21-14-16-xxxx.jsonl" })
 import_chatgpt({ path: "C:\Users\<you>\Downloads\chatgpt-export\conversations.json" })
 import_opencode({ path: "C:\Users\<you>\.local\share\opencode\opencode.db" })
+import_kilocode({ path: "C:\Users\<you>\.local\share\kilo\kilo.db" })
 import_local_jsonl({ path: "D:\downloads\session.jsonl" })
 ```
 
@@ -23,7 +29,7 @@ import_local_jsonl({ path: "D:\downloads\session.jsonl" })
 import_local_jsonl({ path: "D:\downloads\unknown.jsonl", format: "claude" })
 ```
 
-`import_chatgpt` / `import_opencode` / `import_zcode` / `import_hermes` 恒返回批量结果——一个文件 / 数据库包含全部会话，一次调用即可让每段对话成为独立会话。
+`import_chatgpt` / `import_opencode` / `import_kilocode` / `import_zcode` / `import_hermes` 恒返回批量结果——一个文件 / 数据库包含全部会话，一次调用即可让每段对话成为独立会话。
 
 <details>
 <summary><b>导入参数与行为</b></summary>
@@ -34,6 +40,7 @@ import_local_jsonl({ path: "D:\downloads\unknown.jsonl", format: "claude" })
 - `import_chatgpt({ branch: 'all' })` — 把对话 DAG 的**每条 root→leaf 分支**还原为独立会话（主线程仍是最后 child 链；分支会话带后缀源 id 与分支标记标题）。导出里的工具消息还原为真正的 `tool/call` + `tool/result`（结构化 JSON 参数、FIFO 配对），不再是纯文本。
 - `import_claude({ compacted: true })` — 只导长会话的**最后一次压缩摘要 + 尾部**（摘要作前置 `reasoning` 块；标题取 summary 记录）。无 summary 记录时该参数不生效。
 - `import_hermes({ lineage: 'tail' })` — 只导**叶子链尾**（不是任何其它会话父会话的会话）；压缩分叉父会话跳过并标注。
+- `import_chat({ format: 'reasonix', path: '<sessions 目录>' })` — 目录导入默认使用 `lineageMode: 'canonical'`。只有现代 sidecar 把两个文件归入同一逻辑话题、无歧义的 `parent_id` 链明确证明祖先关系，而且祖先的完整语义消息序列是更长后代的真前缀时，才折叠恢复祖先。畸形输入、带 WAL 的检查点、完全相同副本、谱系链缺失及真实分叉叶全部保留。此模式不会替 Reasonix catalog 选择唯一活动叶；真实分支继续独立存在。`lineageMode: 'physical'` 可恢复每个 JSONL 一条会话。
 - **已归档会话可重新导入** — DSH 的归档会把会话从侧边栏隐藏，但保留在持久化里（及其 id）——面板与 `scan_discover` 现在把已归档目标标记为 **已归档 / Archived** 并提供重新导入按钮。再次导入以新 id（`import-<sessionId>-<n>`，与 `force` 同一铸键）另存完整副本，不触碰已归档会话；多会话源（chatgpt / opencode / zcode / hermes 库）内逐会话同样适用。
 - **增量续写（重导）** — 重导同一源路径绝不改写已导入历史：未变文件跳过（`already-imported`，不重读）；增长文件只把**新增轮次** append 进同一会话（`appended`）；截断文件检测并上报（`sourceShrunk`）——需要完整新副本时用 `force: true`：
 
@@ -60,9 +67,11 @@ import_agents({ codexRoot: "~/.codex", apply: true })  // 显式包含 Codex 资
 
 语义：跨源同名冲突加 `-<source>` 后缀消歧（如 `-pi` / `-opencode` / `-codex`）；内容相同幂等跳过；已带 `kind: dsh`/`kind: skill` frontmatter 的源不重复导入；bundle 目录缺 `SKILL.md` 时原地补全（保留既有 `scripts/` 等）；嵌套 YAML（如 `permission:`）原样保留。
 
+定位说明：`import_agents` 只做轻量资产落盘，不覆盖 hooks、权限规则或 settings 等完整配置迁移--后者见 [dsh-movein](https://github.com/sjh9714/dsh-movein)（与本插件分工互补，组合流程未联合验证）。
+
 ### scan_discover — 只读会话发现
 
-`scan_discover` 扫描全部 15 种格式的已知数据根（Windows 上含 Reasonix 桌面版与 Claude-3p 根），返回结构化会话索引（标题、项目、cwd、路径、导入状态，源目录为 git 仓库时附分支/dirty），供批导入前预览。零副作用：
+`scan_discover` 扫描全部 18 种格式的已知数据根（Windows 上含 Reasonix 桌面版与 Claude-3p 根），返回结构化会话索引（标题、项目、cwd、路径、导入状态，源目录为 git 仓库时附分支/dirty），供批导入前预览。零副作用：
 
 ```
 scan_discover()
@@ -78,14 +87,16 @@ list_imported_sessions()
 retract_import({ sessionId: "import-019f5f27-…" })
 ```
 
-### export_claude / export_codex / export_kimi — DSH → 目标格式
+> **撤回后的幽灵会话（#22）** — DSH 宿主没有 delete/forget 面：`retract_import` 并手动删除工件后，会话 id 仍可能占据宿主内存索引（会话列表里可见、直到重启 dsh 才消失），同源重导此前会报 `session "…" already exists in this backend`。现已自愈：重导检测到陈旧条目（list 仍暴露但日志不可读，或 create 拒绝该 id）时**自动另铸后缀新 id**（`import-<id>-1`）完整重导并报告 `staleGhost: { previous, current }`，不再失败；`retract_import` 的 `manualDelete` 引导也注明幽灵会话需重启 dsh 才彻底消失。
 
-`export_claude({ sessionId })` 把现有 DSH 会话（导入的或原生的）序列化为 Claude Code JSONL transcript，可直接 `--resume`。文件写到 `<outputDir>/<slug>/<uuid>.jsonl`（默认 `~/.claude/projects`），文件名是全新 UUID v4——绝不覆盖已有文件。`export_codex` 与 `export_kimi` 分别写 Codex rollout JSONL 与 Kimi `wire.jsonl`（默认 `~/.dsh/exports`）——补齐 DSH↔Claude↔Codex↔Kimi 矩阵（导入边已存在）。每次导出在 `degradations` 字段里逐条列出**有损项**（孤儿工具结果 / 注入跳过 / 附件跳过）——绝不静默丢弃：
+### export_chat — DSH → Claude / Codex / Kimi（矩阵导出）
+
+`export_chat({ format: "claude", sessionId })` 把现有 DSH 会话（导入的或原生的）序列化为 Claude Code JSONL transcript，可直接 `--resume`。文件写到 `<outputDir>/<slug>/<uuid>.jsonl`（默认 `~/.claude/projects`），文件名是全新 UUID v4——绝不覆盖已有文件。`format: "codex"` 与 `format: "kimi"` 分别写 Codex rollout JSONL 与 Kimi `wire.jsonl`（默认 `~/.dsh/exports`，或用 `path: …` 指定目标）——补齐 DSH↔Claude↔Codex↔Kimi 矩阵（导入边已存在）。每次导出在 `degradations` 字段里逐条列出**有损项**（孤儿工具结果 / 注入跳过 / 附件跳过）——绝不静默丢弃：
 
 ```
-export_claude({ sessionId: "import-019f5f27-…" })
-export_codex({ sessionId: "…", dryRun: true })
-export_kimi({ sessionId: "…", outputDir: "D:\backup\kimi" })
+export_chat({ format: "claude", sessionId: "import-019f5f27-…" })
+export_chat({ format: "codex", sessionId: "…", dryRun: true })
+export_chat({ format: "kimi", sessionId: "…", outputDir: "D:\backup\kimi" })
 ```
 
 ### export_bundle / restore_bundle — 便携 interchange bundle
@@ -151,7 +162,7 @@ import_settings()                             // 列出建议
 
 ### sync_to_claude — 增量写回
 
-`sync_to_claude({ sessionId })` 把会话的**新增完整轮次**追加回其 Claude Code 文件——`target: "source"`（默认，写回导入源文件）或 `"copy"`（最近一次 `export_claude` 副本）。文件被外部修改或缩小时一律上报、绝不覆盖；`force: true` 越过外部修改重锚定（被覆盖的守卫仍会上报）：
+`sync_to_claude({ sessionId })` 把会话的**新增完整轮次**追加回其 Claude Code 文件——`target: "source"`（默认，写回导入源文件）或 `"copy"`（最近一次 `export_chat` `format: "claude"` 副本）。文件被外部修改或缩小时一律上报、绝不覆盖；`force: true` 越过外部修改重锚定（被覆盖的守卫仍会上报）：
 
 ```
 sync_to_claude({ sessionId: "import-019f5f27-…" })
@@ -195,3 +206,10 @@ dsh web 侧边栏底部上方有一个「导入会话」浮动胶囊（`sidebar.
 
 - **迁移提示（默认开）**——当会话工作区存在可发现的（已导入或可导入）外部聊天历史时，注入一行 `PromptContext`，告诉模型如何继续（`/import <source> <path>` 命令或侧边栏面板）。per-project 记忆保证同一工作区只提示一次；设 `DSH_IMPORT_SESSION_HINT=0` 关闭。
 - **Claude 上下文桥接（默认关）**——设 `DSH_IMPORT_CONTEXT_BRIDGE=1` 把 Claude Code 的上下文资产桥进会话：`~/.claude/memory/*.md`（按 `feedback` > `project` > `reference` > `user` 分组、8 KiB 上限、mtime 缓存重读）、项目根 `CLAUDE.md` **与全局 `~/.claude/CLAUDE.md`**、以及 `~/.claude/skills/*/SKILL.md`（注册为该 agent 独有的 `claude-<name>` 技能）。
+
+### 设置页（会话导入）
+
+设置页「会话导入」分区提供两个开关，经面板 fenced 路由读写（与 settingsScope 白名单无关）：
+
+- **导入系统提示词（默认开）**——把源会话的 system / developer 提示词作为「上下文注入」保留；关闭后仅保留环境变更声明。
+- **将本插件工具显式注入对话上下文（默认开）**——关闭后不再向对话内的 Agent 注入本插件的 13 个工具（可节省约 5k 上下文）；导入、导出、发现、撤回与双向同步等仍可通过 GUI「导入会话」面板与斜杠命令完成。

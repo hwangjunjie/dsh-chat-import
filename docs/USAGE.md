@@ -4,6 +4,11 @@
 
 ## 🛠 Usage
 
+> **First-migration step flow** (aligned with the [dsh-movein first-migration guide](https://github.com/sjh9714/dsh-movein/blob/main/docs/first-migration.zh.md), Chinese; that tool handles config, this plugin handles conversation history - use either standalone as needed):
+> ① **Preview** - `scan_discover()` or the sidebar panel to inspect importable sessions and status badges; or pass `preview: true` to any `import_*` for a zero-side-effect dry run.
+> ② **Import** - drop `preview` and import for real; verify the per-session `status` by source / workspace (duplicate-import behavior under "Incremental re-import" below).
+> ③ **Health check & retract** - `doctor()` read-only check; `retract_import` to remove the registry record, or the panel History tab to delete plugin-created sessions (with confirmation).
+
 > **Note:** imports persist to disk immediately, but the DSH session list does not auto-refresh — refresh the page (or the session list) after importing to see the new sessions.
 
 **Import — a single file or a directory.** Every `import_*` tool takes a `path`; directories are scanned recursively and each file / conversation becomes its own session:
@@ -13,6 +18,7 @@ import_claude({ path: "C:\Users\<you>\.claude\projects\<slug>\<sessionId>.jsonl"
 import_codex({ path: "C:\Users\<you>\.codex\sessions\2026\05\18\rollout-2026-05-18T21-14-16-xxxx.jsonl" })
 import_chatgpt({ path: "C:\Users\<you>\Downloads\chatgpt-export\conversations.json" })
 import_opencode({ path: "C:\Users\<you>\.local\share\opencode\opencode.db" })
+import_kilocode({ path: "C:\Users\<you>\.local\share\kilo\kilo.db" })
 import_local_jsonl({ path: "D:\downloads\session.jsonl" })
 ```
 
@@ -23,7 +29,7 @@ import_local_jsonl({ path: "D:\downloads\session.jsonl" })
 import_local_jsonl({ path: "D:\downloads\unknown.jsonl", format: "claude" })
 ```
 
-`import_chatgpt` / `import_opencode` / `import_zcode` / `import_hermes` always return a batch result — one file / database holds all conversations, so each conversation becomes its own session in a single call.
+`import_chatgpt` / `import_opencode` / `import_kilocode` / `import_zcode` / `import_hermes` always return a batch result — one file / database holds all conversations, so each conversation becomes its own session in a single call.
 
 <details>
 <summary><b>Import parameters & behaviors</b></summary>
@@ -34,6 +40,7 @@ import_local_jsonl({ path: "D:\downloads\unknown.jsonl", format: "claude" })
 - `import_chatgpt({ branch: 'all' })` — restore **every root→leaf branch** of the conversation DAG as its own session (the main thread stays the last-child chain; branch sessions carry a suffixed source id and a branch-marked title). Tool messages in the export are restored as real `tool/call` + `tool/result` (structured JSON arguments, FIFO pairing) instead of plain text.
 - `import_claude({ compacted: true })` — import only the **last compression summary + tail** of a long session (summary restored as a leading `reasoning` block; title from the summary record). Without a summary record the flag has no effect.
 - `import_hermes({ lineage: 'tail' })` — import only **leaf chain tails** (sessions that are not any other session's parent); compaction-fork parent sessions are skipped and annotated.
+- `import_chat({ format: 'reasonix', path: '<sessions directory>' })` — directory imports default to `lineageMode: 'canonical'`. A recovery ancestor is collapsed only when modern sidecar metadata places both files in the same logical topic, an unambiguous `parent_id` chain proves ancestry, and its complete semantic message sequence is a proper prefix of a longer descendant. Malformed inputs, WAL-backed checkpoints, exact duplicates, missing lineage links, and divergent leaves are retained. This does not choose one active leaf from Reasonix's catalog; genuine branches remain separate. Use `lineageMode: 'physical'` for one session per JSONL.
 - **Archived sessions are re-importable** — DSH's archive hides a session from the sidebar but keeps it (and its id) in persistence, so the panel and `scan_discover` now report an archived target as **已归档 / Archived** with a re-import button. Importing again creates a fresh copy under a new id (`import-<sessionId>-<n>`, same minting as `force`) without touching the archived session; the same applies per-session inside multi-session sources (chatgpt / opencode / zcode / hermes DBs).
 - **Incremental re-import** — re-importing the same source never rewrites imported history. Unchanged files are skipped (`already-imported`) without re-reading; grown files append only their **new turns** to the same session (`appended`); truncated files are detected and reported (`sourceShrunk`) — use `force: true` for a complete fresh copy:
 
@@ -60,9 +67,11 @@ import_agents({ codexRoot: "~/.codex", apply: true })  // include Codex assets e
 
 Semantics: same-name conflicts across sources get a `-<source>` suffix (e.g. `-pi` / `-opencode` / `-codex`); identical content is skipped (idempotent); sources already carrying `kind: dsh`/`kind: skill` frontmatter are not re-imported; a bundle directory that lacks `SKILL.md` is completed in place (preserving existing `scripts/` etc.); nested YAML (e.g. `permission:`) is preserved.
 
+Scope note: `import_agents` is a lightweight asset mover only - it does not cover hooks, permission rules or settings; for full config migration see [dsh-movein](https://github.com/sjh9714/dsh-movein) (complementary to this plugin; the combined flow is not jointly validated).
+
 ### scan_discover — read-only session discovery
 
-`scan_discover` scans the known data roots of all 15 formats (including the Reasonix desktop app and Claude-3p roots on Windows) and returns a structured session index (title, project, cwd, path, import status, and git branch/dirty when the source directory is a git repo) so you can preview before a batch import. Zero side effects:
+`scan_discover` scans the known data roots of all 18 formats (including the Reasonix desktop app and Claude-3p roots on Windows) and returns a structured session index (title, project, cwd, path, import status, and git branch/dirty when the source directory is a git repo) so you can preview before a batch import. Zero side effects:
 
 ```
 scan_discover()
@@ -78,14 +87,16 @@ list_imported_sessions()
 retract_import({ sessionId: "import-019f5f27-…" })
 ```
 
-### export_claude / export_codex / export_kimi — DSH → target format
+> **Ghost sessions after retract (#22)** — the DSH host has no delete/forget API: after `retract_import` and manual artifact deletion, the session id may still occupy the host's in-memory index (it stays visible in the session list until dsh restarts, and re-importing the same source used to fail with `session "…" already exists in this backend`). This is now self-healed: re-import detects the stale entry (still listed but log unreadable, or `create` rejecting the id) and **automatically mints a suffixed new session id** (`import-<id>-1`) with a clear `staleGhost: { previous, current }` report instead of failing; `retract_import`'s `manualDelete` guidance also notes that the ghost only fully disappears after a dsh restart.
 
-`export_claude({ sessionId })` serializes an existing DSH session (imported or native) into a Claude Code JSONL transcript, ready for `--resume`. It is written to `<outputDir>/<slug>/<uuid>.jsonl` (default `~/.claude/projects`), with a fresh UUID v4 file name — an existing file is never overwritten. `export_codex` and `export_kimi` write Codex rollout JSONL and Kimi `wire.jsonl` respectively (default `~/.dsh/exports`) — completing the DSH↔Claude↔Codex↔Kimi matrix (the import edges already exist). Every export lists its **lossy items** in a `degradations` field (orphan tool results, skipped injections, skipped attachments) — nothing is silently dropped:
+### export_chat — DSH → Claude / Codex / Kimi (matrix export)
+
+`export_chat({ format: "claude", sessionId })` serializes an existing DSH session (imported or native) into a Claude Code JSONL transcript, ready for `--resume`. It is written to `<outputDir>/<slug>/<uuid>.jsonl` (default `~/.claude/projects`), with a fresh UUID v4 file name — an existing file is never overwritten. `format: "codex"` and `format: "kimi"` write Codex rollout JSONL and Kimi `wire.jsonl` respectively (default `~/.dsh/exports`, or `path: …` to pick a target) — completing the DSH↔Claude↔Codex↔Kimi matrix (the import edges already exist). Every export lists its **lossy items** in a `degradations` field (orphan tool results, skipped injections, skipped attachments) — nothing is silently dropped:
 
 ```
-export_claude({ sessionId: "import-019f5f27-…" })
-export_codex({ sessionId: "…", dryRun: true })
-export_kimi({ sessionId: "…", outputDir: "D:\backup\kimi" })
+export_chat({ format: "claude", sessionId: "import-019f5f27-…" })
+export_chat({ format: "codex", sessionId: "…", dryRun: true })
+export_chat({ format: "kimi", sessionId: "…", outputDir: "D:\backup\kimi" })
 ```
 
 ### export_bundle / restore_bundle — portable interchange bundle
@@ -151,7 +162,7 @@ import_settings()                             // list suggestions
 
 ### sync_to_claude — incremental write-back
 
-`sync_to_claude({ sessionId })` appends a session's **new complete turns** back to its Claude Code file — `target: "source"` by default (the import source) or `"copy"` (the last `export_claude` copy). Guards report an externally modified or shrunken file instead of overwriting it; `force: true` re-anchors past external edits (the overridden guard is still reported):
+`sync_to_claude({ sessionId })` appends a session's **new complete turns** back to its Claude Code file — `target: "source"` by default (the import source) or `"copy"` (the last `export_chat` `format: "claude"` copy). Guards report an externally modified or shrunken file instead of overwriting it; `force: true` re-anchors past external edits (the overridden guard is still reported):
 
 ```
 sync_to_claude({ sessionId: "import-019f5f27-…" })
@@ -195,3 +206,10 @@ Two optional hooks run when a DSH session starts (the host `agent/session-start`
 
 - **Migration hint (default on)** — when the session's workspace has discoverable external history (already-imported or importable), a one-line `PromptContext` is injected telling the model how to continue (`/import <source> <path>` or the sidebar panel). Per-project memory shows the hint only once per workspace; set `DSH_IMPORT_SESSION_HINT=0` to disable.
 - **Claude context bridge (default off)** — set `DSH_IMPORT_CONTEXT_BRIDGE=1` to bridge Claude Code context assets into the session: `~/.claude/memory/*.md` (grouped `feedback` > `project` > `reference` > `user`, 8 KiB cap, re-read via mtime cache), the project-root `CLAUDE.md` **and global `~/.claude/CLAUDE.md`**, and `~/.claude/skills/*/SKILL.md` (registered as `claude-<name>` skills on this agent only).
+
+### Settings page (Session Import)
+
+The Settings → Session Import section exposes two toggles, read/written through the panel's fenced route (independent of the settingsScope allowlist):
+
+- **Import system prompt (default on)** — keep the source session's system/developer prompt as a "context injection"; turn it off to keep only the environment-change note.
+- **Explicitly inject this plugin's tools into the conversation context (default on)** — turn it off to stop providing this plugin's 13 tools to the agent in-conversation (saving about 5k of context); importing, exporting, discovery, retraction, and two-way sync remain available through the "Import Sessions" panel and slash commands.

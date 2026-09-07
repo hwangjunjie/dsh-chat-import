@@ -1,7 +1,7 @@
 // index.mjs — dsh-chat-import 插件入口（薄组合层）
 //
 // 外部聊天记录（Claude Code / Codex-ChatGPT / ChatGPT / Cursor / Gemini / Reasonix /
-// Pi Coding Agent / opencode / zcode / grokbuild / openclaw / hermes / kimi / qoder）→ DSH 会话
+// Pi Coding Agent / opencode / zcode / grokbuild / openclaw / hermes / kimi / qoder / workbuddy / qwen）→ DSH 会话
 // 导入器 + DSH → Claude Code JSONL 反向导出。消费 host 的 sessionPersistence / fs /
 // tools / workspaceRegistry 服务（webServer 可选，经 ctx.inject 延迟挂载）。
 //
@@ -13,9 +13,9 @@
 //                           归组（REQ-39 cwdHint 权威映射）/ 投影预热 / 标准 dry-run 预览
 //   lib/import-variants.mjs 特殊形态来源编排：chatgpt / grokbuild / hermes / kimi +
 //                           opencode / zcode / hermes / grokbuild / chatgpt 的 dry-run 预览
-//   lib/toolkit.mjs         makeImportTool 工厂（REQ-09 分组 spec）+ IMPORT_SPECS
-//   lib/export-tool.mjs     export_claude / export_codex / export_kimi（REQ-23）/
-//                           export_bundle（REQ-56）执行体
+//   lib/toolkit.mjs         import_chat 分发器工厂（REQ-09 分组 spec）+ IMPORT_SPECS
+//   lib/export-tool.mjs     export_chat 三合一执行体（exportClaudeSession / exportCodexSession /
+//                           exportKimiSession）+ export_bundle（REQ-56）执行体
 //   lib/restore.mjs         REQ-56/62 restore_bundle（指纹校验 + 跨机器归组回退）
 //   lib/verify.mjs          REQ-23 verify_session（只读结构校验 + repair 提示）
 //   lib/handoff.mjs         REQ-30 交接摘要纯函数（不可信静态历史 → 交接摘要）
@@ -23,13 +23,14 @@
 //   lib/retract.mjs         REQ-33 导入识别 / 撤回（list_imported_sessions / retract_import）
 //   lib/discovery-host.mjs  REQ-25/40 scan_discover 的 host 适配（fs + SQLite 摘要）
 //   lib/panel.mjs           REQ-41 面板路由（POST /api-import/sessions + /api-import/import）
-//   lib/tools.mjs           30 个工具的注册（16 导入 + import_agents + doctor +
-//                           import_mcp + import_settings + export×3 + bundle×2 +
-//                           sync + 识别/撤回 + 发现 + verify）
+//   lib/tools.mjs           13 个工具的注册（import_chat 分发器 = 19 个导入源 +
+//                           import_agents + doctor + import_mcp + import_settings +
+//                           export_chat（claude/codex/kimi 三合一）+ bundle×2 + sync +
+//                           识别/撤回 + 发现 + verify）
 //
 // 本文件只做组装：registerTools 注册工具；webServer 是可选且晚挂载的 host 服务，
 // 面板路由经 ctx.inject(['webServer']) 延迟注册（headless / 无 Web 的 profile 不挂载
-// 路由但照常 apply，16 个导入工具与 CLI 会话不受影响）。
+// 路由但照常 apply，13 个工具与 CLI 会话不受影响）。
 
 import { resolveRegistryDir } from './lib/imports.mjs'
 import { registerTools } from './lib/tools.mjs'
@@ -54,7 +55,11 @@ const inject = ['sessionPersistence', 'fs', 'tools']
 function apply(ctx) {
   // REQ-24 imports registry 目录：$DSH_HOME/dsh-chat-import（$DSH_HOME 缺省 ~/.dsh）
   const registryDir = resolveRegistryDir()
-  registerTools(ctx, registryDir)
+  // registerTools 先构建工具定义（makeImportChatTool 同时把 IMPORT_SPECS 落进
+  // lib/toolkit.mjs，面板/命令依赖它），再默认注入并返回 reconcile——settings 就绪/
+  // injectTools 变化时由 registerImportPrefs 驱动注销/重注册（关闭 = 不向 Agent 注入
+  // 工具、省上下文；GUI 面板仍可转换）。
+  const reconcileTools = registerTools(ctx, registryDir)
   // REQ-41 面板路由：webServer 是可选 host 服务且晚挂载——web 组合的服务插件在
   // import-claude apply 之后才发布它，apply 时 ctx.get('webServer') 仍为空（实测
   // 重启后 /api-import/* 一律 405）。用 ctx.inject(['webServer'], …) 在服务可用时
@@ -78,9 +83,11 @@ function apply(ctx) {
   // REQ-28 上下文桥接（默认关闭，env DSH_IMPORT_CONTEXT_BRIDGE=1 开启）：Claude 的
   // memory / CLAUDE.md / skills 桥进 agent 的 scoped systemPrompt / skills 注册。
   registerContextBridge(ctx)
-  // 导入偏好设置命名空间（chat-import）：「导入系统提示词作为上下文注入」开关（默认关）。
-  // ctx.settings 可选，缺席时注册空转；读取见 makeImportTool.execute（lib/toolkit.mjs）。
-  registerImportPrefs(ctx)
+  // 导入偏好设置命名空间（chat-import）：「导入系统提示词作为上下文注入」开关（默认开）
+  // 与「将本插件工具显式注入对话上下文」开关（默认开）。ctx.settings 可选，缺席时注册
+  // 空转；读取见 buildImportExecutor（lib/toolkit.mjs）。injectTools 变化经 reconcileTools
+  // 注销/重注册工具（见上方 registerTools 注释）。
+  registerImportPrefs(ctx, reconcileTools)
 }
 
 export { apply, inject, name, readOpencodeDb, readZcodeDb, exportClaudeSession }

@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { convertClaudeJsonl, convertCodexJsonl, convertCodebuddyJsonl, convertChatgptJson, convertCursorJsonl, convertGeminiJson, convertReasonixJsonl, convertPiJsonl, convertOpencodeJson, reasonixStemTime, mintSessionId, parseTime, SESSION_FORMAT_VERSION, tailSessionEvents, codexCustomToolArguments, jsObjectLiteralToJson, estimateTokens, cropContentBlocks, trimTurns, applyBudgetTrim, TEXT_BLOCK_CHAR_LIMIT, TOOL_RESULT_CHAR_LIMIT, validateSessionEvents } from '../convert.mjs'
+import { pinSourcedSessionTitle } from '../lib/sourced-title.mjs'
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), 'fixtures')
 const load = (name) => readFileSync(join(fixtures, name), 'utf8')
@@ -65,20 +66,19 @@ function assertMessageOrderLegal(events) {
   return msgs
 }
 
-// 内部标记事件契约（REQ-32）：导入会话日志首事件（seq 0）为 session/imported，
-// 顶层 ignorable: true，data 四字段（tool / sourceId / sourcePath / importedAt）。
-function assertImportedMarker(events, { tool, sourceId, sourcePath }) {
-  const ev = events[0]
-  assert.equal(ev.type, 'session/imported')
-  assert.equal(ev.seq, 0)
-  assert.equal(ev.ignorable, true)
-  assert.equal(ev.data.tool, tool)
-  assert.equal(ev.data.sourceId, sourceId)
-  assert.equal(ev.data.sourcePath, sourcePath)
-  assert.equal(typeof ev.data.importedAt, 'number')
-  assert.ok(ev.data.importedAt > 0)
-  // 标记之后才进入回合事件
-  assert.equal(events[1].type, 'turn/start')
+// 导入归属外置 registry（issue #34）：0.8.3 起日志不再写 session/imported 标记，
+// 事件 envelope 键收敛在宿主白名单内（type/seq/time/data/surfaceOp/sourceEventSeqs）。
+function assertEnvelopeHygiene(events) {
+  assert.ok(events.every((e) => e.type !== 'session/imported'), '日志不得含 session/imported 标记')
+  const ALLOWED = new Set(['type', 'seq', 'time', 'data', 'surfaceOp', 'sourceEventSeqs'])
+  for (const e of events) {
+    for (const key of Object.keys(e)) {
+      assert.ok(ALLOWED.has(key), '事件 envelope 出现白名单外键: ' + key)
+    }
+    assert.equal(typeof e.seq, 'number')
+    assert.equal(typeof e.time, 'number')
+    assert.notEqual(e.data, undefined)
+  }
 }
 
 test('convertClaudeJsonl: 简单问答合成平衡回合', () => {
@@ -94,11 +94,11 @@ test('convertClaudeJsonl: 简单问答合成平衡回合', () => {
 
   const types = out.events.map((e) => e.type)
   assert.deepEqual(types, [
-    'session/imported', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end',
+    'user/message', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end',
   ])
   // seq 连续从 0 开始；首事件是内部标记
   out.events.forEach((e, i) => assert.equal(e.seq, i))
-  assertImportedMarker(out.events, { tool: 'claude-code', sourceId: 'sess-simple-001', sourcePath: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
+  assertEnvelopeHygiene(out.events)
   // surface 事件带 surfaceOp
   const surface = out.events.filter((e) => e.type === 'user/message' || e.type === 'assistant/message')
   for (const e of surface) assert.equal(e.surfaceOp, 'append')
@@ -149,8 +149,8 @@ test('convertClaudeJsonl: 多步回合（一步一个 assistant 消息）', () =
   assert.equal(messages.length, 2)
   assert.equal(messages[0].data.step, 1)
   assert.equal(messages[1].data.step, 2)
-  // user/message 只在第一步出现
-  const users = out.events.filter((e) => e.type === 'user/message')
+  // user/message 只在第一步出现（环境变更声明不计入真实 user 消息）
+  const users = out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user')
   assert.equal(users.length, 1)
   assertMessageOrderLegal(out.events)
 })
@@ -177,7 +177,68 @@ test('convertClaudeJsonl: 未回答的提问也成回合', () => {
   assert.equal(out.turns.length, 1)
   assert.equal(out.messages, 1)
   const types = out.events.map((e) => e.type)
-  assert.deepEqual(types, ['session/imported', 'turn/start', 'user/message', 'turn/end'])
+  assert.deepEqual(types, ['user/message', 'turn/start', 'user/message', 'turn/end'])
+})
+
+test('convertClaudeJsonl: 数组格式 user content（纯文本块）开新轮（issue #21 复现）', () => {
+  // Claude Code 新版对直接提问也写 content:[{type:"text",...}]；此前落入 tool_result
+  // 分支被静默丢弃 → 0 轮导入，整段对话丢失
+  const raw = [
+    '{"type":"user","sessionId":"t","cwd":"/tmp","timestamp":"2026-08-01T00:00:00Z","uuid":"u1","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}',
+    '{"type":"assistant","sessionId":"t","cwd":"/tmp","timestamp":"2026-08-01T00:00:01Z","uuid":"u2","message":{"model":"claude","content":[{"type":"text","text":"hi"}]}}',
+  ].join('\n')
+  const out = convertClaudeJsonl(raw, { fileStem: 't' })
+  assert.equal(out.turns.length, 1)
+  assert.equal(out.turns[0].prompt, 'hello')
+  assert.equal(out.messages, 2)
+  assert.equal(out.droppedUserPrompts, 0)
+  assert.equal(out.skipReason, undefined)
+  assertMessageOrderLegal(out.events)
+  const userMsg = out.events.find((e) => e.type === 'user/message' && e.data.source.kind === 'user')
+  assert.equal(userMsg.data.content[0].text, 'hello')
+})
+
+test('convertClaudeJsonl: 多 text 块数组拼接为 prompt（换行分隔）', () => {
+  const raw = [
+    '{"type":"user","sessionId":"t","message":{"role":"user","content":[{"type":"text","text":"第一段"},{"type":"text","text":"第二段"}]}}',
+    '{"type":"assistant","sessionId":"t","message":{"role":"assistant","content":[{"type":"text","text":"回答"}]}}',
+  ].join('\n')
+  const out = convertClaudeJsonl(raw, { fileStem: 't' })
+  assert.equal(out.turns.length, 1)
+  assert.equal(out.turns[0].prompt, '第一段\n第二段')
+})
+
+test('convertClaudeJsonl: 混合转录——字符串/数组提问开轮，tool_result 数组仍走工具结果（issue #21 文件 B 形态）', () => {
+  // 与 issue #21 实测文件 B 同构：字符串提问 + 数组提问 + tool_result 载体混合，
+  // 此前数组提问（11 条）被静默丢弃
+  const raw = [
+    JSON.stringify({ type: 'user', sessionId: 's', message: { role: 'user', content: '字符串提问' } }),
+    JSON.stringify({ type: 'assistant', sessionId: 's', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'call-1', name: 'Bash', input: { command: 'ls' } }] } }),
+    JSON.stringify({ type: 'user', sessionId: 's', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call-1', content: '{"type":"text","text":"out"}' }] } }),
+    JSON.stringify({ type: 'assistant', sessionId: 's', message: { role: 'assistant', content: [{ type: 'text', text: '回答1' }] } }),
+    JSON.stringify({ type: 'user', sessionId: 's', message: { role: 'user', content: [{ type: 'text', text: '数组提问' }] } }),
+    JSON.stringify({ type: 'assistant', sessionId: 's', message: { role: 'assistant', content: [{ type: 'text', text: '回答2' }] } }),
+  ].join('\n')
+  const out = convertClaudeJsonl(raw, { fileStem: 's' })
+  assert.equal(out.turns.length, 2)
+  assert.equal(out.turns[0].prompt, '字符串提问')
+  assert.equal(out.turns[1].prompt, '数组提问')
+  assert.equal(out.messages, 6) // 2 提问 + 3 回答（含 tool_use 条）+ 1 tool_result
+  assert.equal(out.toolCalls, 1)
+  assert.equal(out.droppedUserPrompts, 0)
+  assert.equal(out.droppedToolResults, 0)
+  assertMessageOrderLegal(out.events)
+})
+
+test('convertClaudeJsonl: 无法解析的 user content 计数并在 0 轮时显式标注丢失（issue #21）', () => {
+  const raw = [
+    '{"type":"user","sessionId":"t","message":{"role":"user","content":123}}',
+    '{"type":"assistant","sessionId":"t","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}',
+  ].join('\n')
+  const out = convertClaudeJsonl(raw, { fileStem: 't' })
+  assert.equal(out.turns.length, 0)
+  assert.equal(out.droppedUserPrompts, 1)
+  assert.ok(out.skipReason && out.skipReason.includes('0 轮') && out.skipReason.includes('无法解析'))
 })
 
 test('convertClaudeJsonl: sessionId 覆盖参数生效', () => {
@@ -185,9 +246,10 @@ test('convertClaudeJsonl: sessionId 覆盖参数生效', () => {
   assert.equal(out.meta.id, 'custom-id')
   // sourceId 显式取自源记录，不因 DSH 会话 id 覆盖/前缀解析而改变（REQ-32）
   assert.equal(out.meta.sourceId, 'sess-simple-001')
-  assert.equal(out.events[0].data.sourceId, 'sess-simple-001')
+  assertEnvelopeHygiene(out.events)
   const ids = out.events.filter((e) => e.type === 'user/message').map((e) => e.data.id)
-  assert.ok(ids[0].startsWith('import:custom-id:u1'))
+  // 首条是环境变更声明（import:custom-id:env），真实提问在其后
+  assert.ok(ids.some((id) => id.startsWith('import:custom-id:u1')))
 })
 
 test('convertClaudeJsonl: 空输入不产生事件', () => {
@@ -257,7 +319,7 @@ test('convertClaudeJsonl: 后置的 tool/result 挂到 call 所属 step（不落
   assert.equal(result.surfaceOp, 'append')
   // 投影顺序：user → assistant(带 tool-call) → tool → assistant，合法
   const msgs = assertMessageOrderLegal(out.events)
-  assert.deepEqual(msgs.map((m) => m.role), ['user', 'assistant', 'tool', 'assistant'])
+  assert.deepEqual(msgs.map((m) => m.role), ['user', 'user', 'assistant', 'tool', 'assistant'])
 })
 
 test('convertClaudeJsonl: 中断的 tool_use（无 tool_result）补发空 tool/result', () => {
@@ -297,7 +359,7 @@ test('convertClaudeJsonl: assistant 连续 tool_use、结果后置 → 投影顺
   assert.equal(out.toolCalls, 2)
   assert.equal(out.droppedToolResults, 0)
   const msgs = assertMessageOrderLegal(out.events)
-  assert.deepEqual(msgs.map((m) => m.role), ['user', 'assistant', 'tool', 'assistant', 'tool'])
+  assert.deepEqual(msgs.map((m) => m.role), ['user', 'user', 'assistant', 'tool', 'assistant', 'tool'])
   // 每条 tool 消息与其 call 的 assistant 同 step
   const calls = out.events.filter((e) => e.type === 'tool/call')
   const results = out.events.filter((e) => e.type === 'tool/result')
@@ -386,12 +448,12 @@ test('convertCodexJsonl: 简单问答合成平衡回合（元数据来自 sessio
 
   const types = out.events.map((e) => e.type)
   assert.deepEqual(types, [
-    'session/imported', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end',
+    'user/message', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end',
   ])
   // seq 连续从 0 开始；最后一个事件是 turn/end（平衡）
   out.events.forEach((e, i) => assert.equal(e.seq, i))
   assert.equal(types.at(-1), 'turn/end')
-  assertImportedMarker(out.events, { tool: 'codex', sourceId: '019e3b3f-636d-7cb3-aaab-0255eb45ad4f', sourcePath: 'D:\\demo\\codex\\simple.jsonl' })
+  assertEnvelopeHygiene(out.events)
   // surface 事件带 surfaceOp
   for (const e of out.events.filter((e) => e.type === 'user/message' || e.type === 'assistant/message')) {
     assert.equal(e.surfaceOp, 'append')
@@ -429,7 +491,7 @@ test('convertCodexJsonl: 注入块被过滤、reasoning 加密被跳过、custom
   const out = convertCodexJsonl(load('codex-custom-tool.jsonl'))
   assert.equal(out.turns.length, 1)
   // 注入的 <environment_context> 不进入 prompt
-  const user = out.events.find((e) => e.type === 'user/message').data
+  const user = out.events.find((e) => e.type === 'user/message' && e.data.source.kind === 'user').data
   assert.equal(user.content[0].text, '帮我修这个 bug')
   // 加密 reasoning 不产生 reasoning 块
   assert.equal(out.events.filter((e) => e.type === 'assistant/message').length, 2)
@@ -456,11 +518,13 @@ test('convertCodexJsonl: importSystemPrompt 开关收集 developer 为上下文�
     '{"timestamp":"2026-05-18T13:21:30.754Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}',
     '{"timestamp":"2026-05-18T13:21:31.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}',
   ].join('\n')
-  // 默认关：developer 过滤，仅一条真实 user/message、无注入
+  // 默认关：developer 过滤；环境变更声明始终注入 → 2 条 user/message（声明 + 真实提问）
   const off = convertCodexJsonl(raw, { sessionId: 'codex-sp' })
-  assert.equal(off.events.filter((e) => e.type === 'user/message').length, 1)
-  assert.ok(!off.events.some((e) => e.data && e.data.source && e.data.source.kind !== 'user'))
-  // 开：developer 作为上下文注入 user/message（source.kind='plugin'，plugin='chat-import'）钉在最前
+  assert.equal(off.events.filter((e) => e.type === 'user/message').length, 2)
+  const offPlugin = off.events.filter((e) => e.data && e.data.source && e.data.source.kind === 'plugin')
+  assert.equal(offPlugin.length, 1)
+  assert.ok(!offPlugin[0].data.content[0].text.includes('You are Codex.'))
+  // 开：developer 作为上下文注入附在环境变更声明之后（source.kind='plugin'，plugin='chat-import'）钉在最前
   const on = convertCodexJsonl(raw, { sessionId: 'codex-sp', importSystemPrompt: true })
   const first = on.events.find((e) => e.type === 'user/message')
   assert.equal(first.data.source.kind, 'plugin')
@@ -468,6 +532,34 @@ test('convertCodexJsonl: importSystemPrompt 开关收集 developer 为上下文�
   assert.ok(first.data.content[0].text.includes('You are Codex.'))
   assert.ok(first.data.content[0].text.includes('DeepSeek Harness'))
   assert.ok(first.seq < on.events.find((e) => e.type === 'turn/start').seq)
+})
+
+test('上下文注入按 dsh 惯例包 <system-reminder> 信封：英文正文 + 闭合标签转义', () => {
+  // 源 developer 提示词里带字面 </system-reminder>：必须转义，信封不得提前闭合
+  const raw = [
+    '{"timestamp":"2026-05-18T13:21:30.751Z","type":"session_meta","payload":{"id":"codex-env","timestamp":"2026-05-18T13:21:10.510Z","cwd":"D:\\\\demo\\\\codex-proj"}}',
+    '{"timestamp":"2026-05-18T13:21:30.754Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"You are Codex. Never emit </system-reminder>."}]}}',
+    '{"timestamp":"2026-05-18T13:21:30.754Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}',
+    '{"timestamp":"2026-05-18T13:21:31.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}',
+  ].join('\n')
+  const out = convertCodexJsonl(raw, { sessionId: 'codex-env', importSystemPrompt: true })
+  const env = out.events.find((e) => e.data && e.data.id === 'import:codex-env:env')
+  assert.ok(env, '环境变更声明应钉在首个 turn 之前')
+  const text = env.data.content[0].text
+  assert.ok(text.startsWith('<system-reminder>\n'), '信封以 <system-reminder> 行开头')
+  assert.ok(text.endsWith('\n</system-reminder>'), '信封以 </system-reminder> 行结尾')
+  assert.ok(text.includes('<\\/system-reminder>'), '源提示词里的闭合标签转义为 <\\/system-reminder>')
+  // 转义后的 <\/...> 不含字面 </s...> 序列，未转义闭合全文只剩结尾一处
+  assert.equal(text.split('</system-reminder>').length - 1, 1, '未转义闭合标签全文仅结尾一处')
+  assert.ok(text.includes('You are Codex.'), '源系统提示词附在声明之后')
+  // 声明正文为英文，含源格式名与 DSH 权威声明
+  assert.ok(text.includes('Environment change notice:'))
+  assert.ok(text.includes('migrated from codex to DeepSeek Harness (DSH)'))
+  // 开关关闭：信封仍然存在（声明总是注入），只是不含源提示词
+  const off = convertCodexJsonl(raw, { sessionId: 'codex-env' })
+  const offText = off.events.find((e) => e.data && e.data.id === 'import:codex-env:env').data.content[0].text
+  assert.ok(offText.startsWith('<system-reminder>\n') && offText.endsWith('\n</system-reminder>'))
+  assert.ok(!offText.includes('You are Codex.'))
 })
 
 test('convertCodexJsonl: function_call 无 function_call_output 补发空 tool/result', () => {
@@ -496,7 +588,7 @@ test('convertCodexJsonl: event_msg 重复消息不重复计数、多轮正确切
   assert.equal(out.messages, 4) // 每轮 user + assistant（event_msg 重复不计）
   const starts = out.events.filter((e) => e.type === 'turn/start')
   assert.equal(starts.length, 2)
-  const users = out.events.filter((e) => e.type === 'user/message')
+  const users = out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user')
   assert.equal(users.length, 2)
   assert.equal(users[0].data.content[0].text, '第一个问题')
   assert.equal(users[1].data.content[0].text, '第二个问题')
@@ -570,12 +662,13 @@ test('convertCodebuddyJsonl: 简单问答合成平衡回合（sessionId/cwd 取�
 
   const types = out.events.map((e) => e.type)
   assert.deepEqual(types, [
-    'session/imported', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end', 'session/title',
+    'user/message', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end', 'session/title',
   ])
   // seq 连续从 0 开始；事件以 turn/end 平衡收尾（session/title 钉在最后，不破坏回合平衡）
   out.events.forEach((e, i) => assert.equal(e.seq, i))
   assert.equal([...types].reverse().find((t) => t !== 'session/title'), 'turn/end')
-  assertImportedMarker(out.events, { tool: 'codebuddy', sourceId: 'abc123-simple', sourcePath: '/demo/codebuddy/simple.jsonl' })
+  // 导入归属外置 registry（issue #34）：0.8.3 起日志不再写 session/imported 标记
+  assert.ok(out.events.every((e) => e.type !== 'session/imported'), '日志不得含 session/imported 标记')
   // surface 事件带 surfaceOp
   for (const e of out.events.filter((e) => e.type === 'user/message' || e.type === 'assistant/message')) {
     assert.equal(e.surfaceOp, 'append')
@@ -745,7 +838,7 @@ test('convertChatgptJson: 一文件多会话、多轮、mapping 主线程', () =
   assert.equal(c1.turns.length, 2)
   assert.equal(c1.messages, 3)
   assert.equal(c1.toolCalls, 0)
-  assertImportedMarker(c1.events, { tool: 'chatgpt', sourceId: 'conv-001', sourcePath: 'D:\\demo\\chatgpt\\conversations.json' })
+  assertEnvelopeHygiene(c1.events)
   const types1 = c1.events.map((e) => e.type)
   // 事件以 turn/end 平衡收尾（session/title 钉在最后，不破坏回合平衡）
   assert.equal(types1.filter((t) => t === 'turn/end').length, 2)
@@ -761,7 +854,7 @@ test('convertChatgptJson: 一文件多会话、多轮、mapping 主线程', () =
   const c2 = out.conversations.find((c) => c.meta.id === 'import-conv-002')
   assert.ok(c2)
   assert.equal(c2.turns.length, 1)
-  assertImportedMarker(c2.events, { tool: 'chatgpt', sourceId: 'conv-002', sourcePath: 'D:\\demo\\chatgpt\\conversations.json' })
+  assertEnvelopeHygiene(c2.events)
   const asst2 = c2.events.filter((e) => e.type === 'assistant/message').map((e) => e.data.message.content[0].text)
   assert.deepEqual(asst2, ['Here is a simple aglio e olio recipe.', 'Actually, use cacio e pepe instead.'])
 })
@@ -794,7 +887,10 @@ test('convertChatgptJson: importSystemPrompt 开关收集 system 角色为上下
   }
   const off = convertChatgptJson(JSON.stringify([conv]))
   assert.equal(off.conversations.length, 1)
-  assert.ok(!off.conversations[0].events.some((e) => e.data && e.data.source && e.data.source.kind !== 'user'))
+  // 默认关：system 过滤；环境变更声明始终注入（唯一 plugin 注入，不含 system 原文）
+  const offPlugin = off.conversations[0].events.filter((e) => e.data && e.data.source && e.data.source.kind === 'plugin')
+  assert.equal(offPlugin.length, 1)
+  assert.ok(!offPlugin[0].data.content[0].text.includes('You are a helpful assistant.'))
   const on = convertChatgptJson(JSON.stringify([conv]), { importSystemPrompt: true })
   const c1 = on.conversations[0]
   const first = c1.events.find((e) => e.type === 'user/message')
@@ -994,12 +1090,12 @@ test('convertCursorJsonl: 简单问答、user_query 剥离、平衡回合', () =
   assert.equal(out.toolCalls, 0)
   assert.equal(out.meta.id, 'import-abc123') // cursorId 传入
   assert.equal(out.meta.sourceId, 'abc123')
-  assertImportedMarker(out.events, { tool: 'cursor', sourceId: 'abc123', sourcePath: 'D:\\demo\\cursor\\composer-abc.jsonl' })
+  assertEnvelopeHygiene(out.events)
   const types = out.events.map((e) => e.type)
   assert.equal(types.filter((t) => t === 'turn/end').length, 1)
   out.events.forEach((e, i) => assert.equal(e.seq, i))
   // user_query 标签被剥离
-  const user = out.events.find((e) => e.type === 'user/message').data
+  const user = out.events.find((e) => e.type === 'user/message' && e.data.source.kind === 'user').data
   assert.equal(user.content[0].text, 'Create a basic python interpreter in rust.')
   // provider
   const asst = out.events.find((e) => e.type === 'assistant/message').data.message
@@ -1011,6 +1107,7 @@ test('convertCursorJsonl: tool_use → tool/call + 合成空 tool/result，input
   assert.equal(out.toolCalls, 2)
   const calls = out.events.filter((e) => e.type === 'tool/call')
   assert.equal(calls.length, 2)
+  assert.notEqual(calls[0].data.callId, calls[1].data.callId)
   assert.equal(calls[0].data.name, 'Glob')
   assert.equal(calls[0].data.arguments, '{"target_directory":".","glob_pattern":"**/*.rs"}')
   assert.equal(calls[1].data.name, 'Read')
@@ -1024,6 +1121,27 @@ test('convertCursorJsonl: tool_use → tool/call + 合成空 tool/result，input
   const types = out.events.map((e) => e.type)
   assert.equal([...types].reverse().find((t) => t !== 'session/title'), 'turn/end')
   assertMessageOrderLegal(out.events)
+})
+
+test('convertCursorJsonl: 同一步多个 tool_use 不重复 callId（避免 DSH 历史加载失败）', () => {
+  const out = convertCursorJsonl(load('cursor-dual-tool-same-step.jsonl'))
+  const calls = out.events.filter((e) => e.type === 'tool/call')
+  assert.equal(calls.length, 2)
+  const ids = calls.map((e) => e.data.callId)
+  assert.equal(new Set(ids).size, 2, 'callId 必须唯一：' + ids.join(', '))
+  const user = out.events.find((e) => e.type === 'user/message' && e.data.source.kind === 'user').data
+  assert.ok(!user.content[0].text.includes('<timestamp>'), '用户正文应剥离 timestamp')
+  assert.ok(!user.content[0].text.includes('<user_query>'), '用户正文应剥离 user_query')
+  assertMessageOrderLegal(out.events)
+})
+
+test('convertCursorJsonl: pinSourcedSessionTitle 后标题为 Cursor · 话题', () => {
+  const out = convertCursorJsonl(load('cursor-dual-tool-same-step.jsonl'))
+  pinSourcedSessionTitle(out, 'Cursor')
+  assert.match(out.title, /^Cursor · /)
+  const titleEv = out.events.find((e) => e.type === 'session/title')
+  assert.ok(titleEv)
+  assert.match(titleEv.data.title, /^Cursor · /)
 })
 
 test('convertCursorJsonl: [REDACTED] 哨兵过滤', () => {
@@ -1056,12 +1174,12 @@ test('convertGeminiJson: 简单会话、元数据、平衡回合', () => {
   assert.equal(out.meta.sourceId, 'b26d7f99-0116-4d1d-b125-98c228a4b933')
   assert.equal(out.meta.cwd, 'D:\\demo\\gemini-proj') // directories[0] → cwd
   assert.ok(out.meta.createdAt) // startTime ISO → ms
-  assertImportedMarker(out.events, { tool: 'gemini', sourceId: 'b26d7f99-0116-4d1d-b125-98c228a4b933', sourcePath: 'D:\\demo\\gemini\\session-abc.json' })
+  assertEnvelopeHygiene(out.events)
   const types = out.events.map((e) => e.type)
   assert.equal([...types].reverse().find((t) => t !== 'session/title'), 'turn/end')
   out.events.forEach((e, i) => assert.equal(e.seq, i))
   // 用户 parts 数组 → prompt
-  const user = out.events.find((e) => e.type === 'user/message').data
+  const user = out.events.find((e) => e.type === 'user/message' && e.data.source.kind === 'user').data
   assert.equal(user.content[0].text, 'Create a basic python interpreter in rust.')
   // thoughts → reasoning；真实 model
   const asst = out.events.find((e) => e.type === 'assistant/message').data.message
@@ -1122,7 +1240,7 @@ test('convertGeminiJson: 多轮切分、kind 缺失兼容', () => {
   assert.equal(out.turns.length, 2)
   const starts = out.events.filter((e) => e.type === 'turn/start')
   assert.equal(starts.length, 2)
-  const users = out.events.filter((e) => e.type === 'user/message')
+  const users = out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user')
   assert.equal(users.length, 2)
 })
 
@@ -1150,7 +1268,7 @@ test('convertReasonixJsonl: v1 嵌套 tool_calls + tool_call_id 配对 + reasoni
   assert.equal(out.toolCalls, 1)
   assert.equal(out.meta.id, 'import-desktop-202606020721-1')
   assert.equal(out.meta.sourceId, 'desktop-202606020721-1')
-  assertImportedMarker(out.events, { tool: 'reasonix', sourceId: 'desktop-202606020721-1', sourcePath: 'D:\\demo\\reasonix\\desktop-a.jsonl' })
+  assertEnvelopeHygiene(out.events)
   const types = out.events.map((e) => e.type)
   assert.equal([...types].reverse().find((t) => t !== 'session/title'), 'turn/end')
   out.events.forEach((e, i) => assert.equal(e.seq, i))
@@ -1314,7 +1432,7 @@ test('convertPiJsonl: 简单问答、头行元数据、平衡回合', () => {
   assert.equal(out.meta.version, SESSION_FORMAT_VERSION)
   assert.equal(out.meta.cwd, 'D:\\demo\\pi-proj')
   assert.ok(out.meta.createdAt)
-  assertImportedMarker(out.events, { tool: 'pi-coding-agent', sourceId: '019f0a11-2222-7333-8444-555566667777', sourcePath: 'D:\\demo\\pi-proj\\2025-06-01_pi-simple.jsonl' })
+  assertEnvelopeHygiene(out.events)
   const types = out.events.map((e) => e.type)
   assert.equal(types.at(-1), 'turn/end')
   out.events.forEach((e, i) => assert.equal(e.seq, i))
@@ -1417,7 +1535,7 @@ test('convertOpencodeJson: 简单问答、元数据、平衡回合', () => {
   assert.equal(out.meta.cwd, 'E:/demo/opencode-proj')
   assert.equal(out.meta.createdAt, 1786000000000)
   assert.equal(out.title, 'Fix the build')
-  assertImportedMarker(out.events, { tool: 'opencode', sourceId: 'ses_simple001', sourcePath: 'E:/demo/opencode/opencode.db' })
+  assertEnvelopeHygiene(out.events)
   const types = out.events.map((e) => e.type)
   // 回合平衡：最后一个（非 title）事件是 turn/end；seq 连续
   assert.equal([...types].reverse().find((t) => t !== 'session/title'), 'turn/end')
@@ -1425,7 +1543,7 @@ test('convertOpencodeJson: 简单问答、元数据、平衡回合', () => {
   for (const e of out.events.filter((e) => e.type === 'user/message' || e.type === 'assistant/message' || e.type === 'tool/result')) {
     assert.equal(e.surfaceOp, 'append')
   }
-  const user = out.events.find((e) => e.type === 'user/message').data
+  const user = out.events.find((e) => e.type === 'user/message' && e.data.source.kind === 'user').data
   assert.equal(user.content[0].text, '帮我看看构建失败的原因')
   // 消息级 model（字符串）优先于会话级 model
   const asst = out.events.find((e) => e.type === 'assistant/message').data.message
@@ -1537,7 +1655,8 @@ test('convertOpencodeJson: sessionId 覆盖参数生效、空 messages 不产生
   const out = convertOpencodeJson(load('opencode-simple.json'), { sessionId: 'custom-opencode' })
   assert.equal(out.meta.id, 'custom-opencode')
   const ids = out.events.filter((e) => e.type === 'user/message').map((e) => e.data.id)
-  assert.ok(ids[0].startsWith('import:custom-opencode:u1'))
+  // 首条是环境变更声明（import:custom-opencode:env），真实提问在其后
+  assert.ok(ids.some((id) => id.startsWith('import:custom-opencode:u1')))
   // 无 messages → 空事件，由 index 层计 skipped
   const empty = convertOpencodeJson('{"id":"ses_empty","createdAt":1,"messages":[]}')
   assert.equal(empty.turns.length, 0)
@@ -1742,7 +1861,7 @@ test('tailSessionEvents: 指向尾外的 sourceEventSeqs 原样保留并计 drop
   const ev = (type, seq, data, extra) => ({ type, seq, data, ...extra })
   const converted = {
     events: [
-      ev('session/imported', 0, {}),
+      ev(0, {}),
       ev('turn/start', 1, { turn: 1 }),
       ev('user/message', 2, {}, { surfaceOp: 'append' }),
       ev('assistant/message', 3, {}, { surfaceOp: 'append' }),
@@ -2018,6 +2137,43 @@ test('validateSessionEvents：未知类型 / surface 缺 surfaceOp / sourceEvent
     ev(1, 'tool/result', { surfaceOp: 'append', sourceEventSeqs: [0] }),
   ])
   assert.ok(badRef.problems.some((p) => p.kind === 'source-event-seqs-not-call'))
+})
+
+test('validateSessionEvents：宿主运行时/状态事件类型不再误报 unknown-type（issue #20 附注）', () => {
+  // 原生 DSH 会话含运行时/状态事件（issue #20 附注点名的 6 种 + 代表性扩展），
+  // 白名单对齐宿主词汇表后应 0 告警，而不是被判 unknown-type。
+  const runtimeTypes = [
+    'permission/preset', 'sandbox/mode', 'approval/policy', 'agent/inbox/spliced',
+    'request/header', 'assistant/chunk',
+    'todo/write', 'request/context', 'session/end-seed', 'tool/code-dispatch',
+    'compaction/start', 'plan/mode', 'team/task', 'tool-workflow/run-start',
+    'web/deepseek-search-llm-request',
+  ]
+  const r = validateSessionEvents(runtimeTypes.map((type, i) => ev(i, type)))
+  assert.equal(r.ok, true)
+  assert.deepEqual(r.problems, [])
+})
+
+test('validateSessionEvents：原生会话 sourceEventSeqs/surfaceOp 语义不再误报（issue #20 附注）', () => {
+  // assistant/message 在原生会话可引用 assistant/chunk（消息重建），不应判 source-event-seqs-not-call
+  const assistantRef = validateSessionEvents([
+    ev(0, 'assistant/chunk'),
+    ev(1, 'assistant/message', { surfaceOp: 'append', sourceEventSeqs: [0] }),
+  ])
+  assert.equal(assistantRef.ok, true)
+
+  // compaction 的 replace surfaceOp 是合法形态，不应判 missing-surface-op
+  const replaceOp = validateSessionEvents([
+    ev(0, 'assistant/message', { surfaceOp: { op: 'replace', start: 0, end: 0 } }),
+  ])
+  assert.equal(replaceOp.ok, true)
+
+  // tool/result 指向非 tool/call 仍报 source-event-seqs-not-call（回归不变）
+  const toolResultBadRef = validateSessionEvents([
+    ev(0, 'assistant/chunk'),
+    ev(1, 'tool/result', { surfaceOp: 'append', sourceEventSeqs: [0] }),
+  ])
+  assert.ok(toolResultBadRef.problems.some((p) => p.kind === 'source-event-seqs-not-call'))
 })
 
 test('validateSessionEvents：指向集合外的 sourceEventSeqs 合法（append 尾片跨轮引用）', () => {

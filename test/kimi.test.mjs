@@ -56,18 +56,19 @@ function assertMessageOrderLegal(events) {
   return msgs
 }
 
-// 内部标记事件契约（REQ-32）：导入会话日志首事件（seq 0）为 session/imported。
-function assertImportedMarker(events, { tool, sourceId, sourcePath }) {
-  const ev = events[0]
-  assert.equal(ev.type, 'session/imported')
-  assert.equal(ev.seq, 0)
-  assert.equal(ev.ignorable, true)
-  assert.equal(ev.data.tool, tool)
-  assert.equal(ev.data.sourceId, sourceId)
-  assert.equal(ev.data.sourcePath, sourcePath)
-  assert.equal(typeof ev.data.importedAt, 'number')
-  assert.ok(ev.data.importedAt > 0)
-  assert.equal(events[1].type, 'turn/start')
+// 导入归属外置 registry（issue #34）：0.8.3 起日志不再写 session/imported 标记，
+// 事件 envelope 键收敛在宿主白名单内（type/seq/time/data/surfaceOp/sourceEventSeqs）。
+function assertEnvelopeHygiene(events) {
+  assert.ok(events.every((e) => e.type !== 'session/imported'), '日志不得含 session/imported 标记')
+  const ALLOWED = new Set(['type', 'seq', 'time', 'data', 'surfaceOp', 'sourceEventSeqs'])
+  for (const e of events) {
+    for (const key of Object.keys(e)) {
+      assert.ok(ALLOWED.has(key), '事件 envelope 出现白名单外键: ' + key)
+    }
+    assert.equal(typeof e.seq, 'number')
+    assert.equal(typeof e.time, 'number')
+    assert.notEqual(e.data, undefined)
+  }
 }
 
 // 合成 wire.jsonl：首行 metadata + 记录（timestamp 秒级递增）。
@@ -103,10 +104,10 @@ test('convertKimiWire: 简单问答（TurnBegin/StepBegin/TextPart/TurnEnd）、
   assert.ok(!out.events.some((e) => e.type === 'session/title'))
   const types = out.events.map((e) => e.type)
   assert.deepEqual(types, [
-    'session/imported', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end',
+    'user/message', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end',
   ])
   out.events.forEach((e, i) => assert.equal(e.seq, i))
-  assertImportedMarker(out.events, { tool: 'kimi', sourceId: 'sess-001', sourcePath: SRC })
+  assertEnvelopeHygiene(out.events)
   for (const e of out.events.filter((e) => e.type === 'user/message' || e.type === 'assistant/message')) {
     assert.equal(e.surfaceOp, 'append')
   }
@@ -125,7 +126,7 @@ test('convertKimiWire: custom_title（state.json）钉 session/title 事件且�
   assert.equal(out.title, '自定义标题')
   assert.equal(out.events.at(-1).type, 'session/title')
   assert.equal(out.events.at(-1).data.title, '自定义标题')
-  assertImportedMarker(out.events, { tool: 'kimi', sourceId: 'sess-001', sourcePath: SRC })
+  assertEnvelopeHygiene(out.events)
 })
 
 test('convertKimiWire: ToolCall → tool/call + ToolResult → tool/result（sourceEventSeqs 关联）', () => {
@@ -203,7 +204,7 @@ test('convertKimiWire: SteerInput 开新轮（每条用户输入一轮）', () =
     ev('TurnEnd'),
   ]), { sourcePath: SRC, kimiId: 'sess-001' })
   assert.equal(out.turns.length, 2)
-  const users = out.events.filter((e) => e.type === 'user/message').map((e) => e.data.content[0].text)
+  const users = out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user').map((e) => e.data.content[0].text)
   assert.deepEqual(users, ['第一个问题', '第二个问题'])
   const starts = out.events.filter((e) => e.type === 'turn/start')
   assert.equal(starts.length, 2)
@@ -302,7 +303,7 @@ test('convertKimiWire: 畸形行计数、records、多轮切分', () => {
   assert.equal(out.skipped, 1) // 畸形行只计 skipped
   assert.equal(out.records, 5) // 成功解析的行数（含 metadata）
   assert.equal(out.turns.length, 2)
-  const users = out.events.filter((e) => e.type === 'user/message').map((e) => e.data.content[0].text)
+  const users = out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user').map((e) => e.data.content[0].text)
   assert.deepEqual(users, ['问题一', '问题二'])
 })
 
@@ -313,7 +314,7 @@ test('convertKimiWire: user_input 为 ContentPart 数组（图片占位等）取
     ev('TextPart', { text: '好的' }),
     ev('TurnEnd'),
   ]), { sourcePath: SRC, kimiId: 'sess-001' })
-  const user = out.events.find((e) => e.type === 'user/message').data
+  const user = out.events.find((e) => e.type === 'user/message' && e.data.source.kind === 'user').data
   assert.equal(user.content[0].text, '看这张图')
 })
 
@@ -341,7 +342,6 @@ test('convertKimiWire: sessionId 覆盖与 budget 裁剪透传（REQ-37）', () 
   assert.equal(out.meta.id, 'custom-kimi')
   // sourceId 显式取自 kimiId，不因 DSH 会话 id 覆盖/前缀解析而改变（REQ-32）
   assert.equal(out.meta.sourceId, 'sess-001')
-  assert.equal(out.events[0].data.sourceId, 'sess-001')
   assert.ok(out.trimmed)
   assert.ok(out.trimmed.droppedTurns > 0)
   assert.ok(out.trimmed.estimatedTokens <= 1000)
@@ -384,7 +384,7 @@ test('convertKimiWire: 空 user_input 的 TurnBegin 不建轮（后续内容挂�
     ev('TurnEnd'),
   ]), { sourcePath: SRC, kimiId: 'sess-001' })
   assert.equal(out.turns.length, 1)
-  const users = out.events.filter((e) => e.type === 'user/message')
+  const users = out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user')
   assert.equal(users.length, 1)
   assert.equal(users[0].data.content[0].text, '真实问题')
 })
@@ -437,7 +437,7 @@ test('convertKimiWire: 新 Kimi Code tool.call/tool.result 配对；turn.prompt 
   ]), { sourcePath: SRC, kimiId: 'sess-001' })
   assert.equal(out.turns.length, 1)
   assert.equal(out.toolCalls, 1)
-  assert.equal(out.events.filter((e) => e.type === 'user/message').length, 1) // append_message 不重复建轮
+  assert.equal(out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user').length, 1) // append_message 不重复建轮
   const call = out.events.find((e) => e.type === 'tool/call')
   assert.equal(call.data.arguments, '{"command":"npm test"}') // 对象 args → JSON 字符串
   const result = out.events.find((e) => e.type === 'tool/result')
@@ -456,7 +456,7 @@ test('convertKimiWire: 新 wire 无 turn.prompt 时 context.append_message 兜�
     newEv('turn.ended', { turnId: 0, reason: 'completed' }),
   ]), { sourcePath: SRC, kimiId: 'sess-001' })
   assert.equal(out.turns.length, 1)
-  const users = out.events.filter((e) => e.type === 'user/message')
+  const users = out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user')
   assert.equal(users.length, 1)
   assert.equal(users[0].data.content[0].text, '只有 append_message')
 })

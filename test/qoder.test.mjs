@@ -144,18 +144,14 @@ test('多轮对话：每条直连 user 提问开新轮', () => {
   assert.equal(out.messages, 4)
 })
 
-test('session/imported 内部标记钉在日志头（REQ-32）', () => {
+test('导入归属外置 registry：日志无标记，首事件为环境变更声明（issue #34）', () => {
   const raw = qoder([
     userRec('hi'),
     assistantRec([{ type: 'text', text: 'yo' }]),
   ])
   const out = convertQoderJsonl(raw, { sourcePath: '/home/u/.qoder/projects/p/' + SID + '.jsonl' })
-  const ev = out.events[0]
-  assert.equal(ev.type, 'session/imported')
-  assert.equal(ev.seq, 0)
-  assert.equal(ev.ignorable, true)
-  assert.equal(ev.data.tool, 'qoder')
-  assert.equal(ev.data.sourceId, SID)
-  assert.equal(ev.data.sourcePath, '/home/u/.qoder/projects/p/' + SID + '.jsonl')
+  assert.ok(out.events.every((e) => e.type !== 'session/imported'))
+  assert.equal(out.events[0].type, 'user/message')
+  assert.equal(out.events[0].data.source.kind, 'plugin')
   assert.equal(out.events[1].type, 'turn/start')
 })

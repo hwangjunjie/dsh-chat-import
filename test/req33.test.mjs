@@ -3,7 +3,7 @@
 // readFrom / locate，刻意不提供 delete / remove 面）+ mock fs（追踪调用，REQ-33
 // 工具不应触碰）+ 真实 imports registry（$DSH_HOME/dsh-chat-import）。
 //
-// 覆盖：list_imported_sessions 只列带 session/imported 标记会话（locate 路径正确、
+// 覆盖：list_imported_sessions 以 imports registry 反查为权威（locate 路径正确、
 // 标题/源路径/导入时间）、无标记会话不出现（registry 记录也不能让无标记会话上榜）、
 // 日志读不到时 registry 兜底识别；retract_import 移除 registry 记录 + 手动删除引导 +
 // 零删除保证（无 delete/remove 调用、会话工件仍在）、幂等、按 sourcePath 撤回 multi、
@@ -23,6 +23,13 @@ const T0 = 1710000000000 // 固定毫秒时间戳（导入时间）
 beforeEach(() => {
   process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-home-'))
 })
+
+// 辅助：import_chat 分发器定义——execute 时注入 format（收敛后单工具的测试形态，
+// 等价旧 import_claude 的调用方式）
+function chatDef(ctx, format = 'claude') {
+  const tool = ctx.tools.registered('import_chat')
+  return { ...tool, execute: (args) => tool.execute({ format, ...args }) }
+}
 
 // ── 自包含 mock ────────────────────────────────────────────────
 
@@ -48,15 +55,30 @@ function balancedEvents(marker, title) {
 // 内存会话库：list / readFrom / locate / create / append / inspect。
 // 刻意没有 delete / remove 面（平台 sessionPersistence 亦无）——测试断言撤回
 // 全程零删除。readFromThrows 模拟日志不可读（registry 兜底场景）。
+// issue #22 幽灵会话支持：
+//   ghost(id)    —— 模拟「宿主内存索引仍保留 id，但工件已删」：list 仍返回该会话
+//                   （GUI 列表可见），inspect / readFrom 抛错（磁盘侧已认可删除）；
+//   hostReject(id)—— 模拟更病态的宿主：list 已不暴露该 id，但 create 仍对原 id 抛
+//                   `already exists in this backend`（真实 DSH 0.1.1-rc.2 行为）。
 function makePersistence() {
   const sessions = new Map()
   const calls = []
+  const rejectIds = new Set() // create 拒绝的幽灵 id（list 不暴露）
   const api = {
     sessions,
     calls,
+    ghost(id) {
+      const s = sessions.get(id)
+      if (s) { s.ghosted = true; s.readFromThrows = true }
+    },
+    hostReject(id) {
+      rejectIds.add(id)
+      sessions.delete(id) // list 不再暴露
+    },
     async list() { calls.push('list'); return [...sessions.values()].map((s) => s.meta) },
     async create(meta) {
       calls.push('create')
+      if (rejectIds.has(meta.id)) throw new Error('session "' + meta.id + '" already exists in this backend')
       if (sessions.has(meta.id)) throw new Error('duplicate session ' + meta.id)
       sessions.set(meta.id, { meta, events: [], readFromThrows: false })
     },
@@ -68,6 +90,7 @@ function makePersistence() {
       calls.push('inspect')
       const s = sessions.get(id)
       if (!s) throw new Error('unknown session ' + id)
+      if (s.ghosted) throw new Error('session artifact missing (ghost)')
       return { meta: s.meta, events: s.events }
     },
     async readFrom(id, fromSeq = 0) {
@@ -176,17 +199,23 @@ test('list_imported_sessions：只列带标记会话，locate 路径 / 标题 / 
   assert.ok(!persistence.calls.includes('create') && !persistence.calls.includes('append'), '识别零副作用')
 })
 
-test('list_imported_sessions：无标记会话不出现（registry 记录也不能让无标记会话上榜——标记是权威信号）', async () => {
+test('list_imported_sessions：registry 反查是权威（0.8.3 起日志无标记也上榜，issue #34）', async () => {
   const persistence = makePersistence()
-  // 日志读成功但首事件不是标记（legacy / 原生会话）；registry 却登记它是导入会话
-  seedSession(persistence, { id: 'legacy-x', events: balancedEvents(null) })
-  await rememberImport(resolveRegistryDir(), 'D:\\src\\legacy.jsonl', { kind: 'single', dshId: 'legacy-x', turns: 1, events: 6, sizeBytes: 1, version: 'v1', args: '[]', importedAt: T0 })
+  // 0.8.3+ 导入的会话：日志无标记，归属只在 registry
+  seedSession(persistence, { id: 'import-x', events: balancedEvents(null) })
+  await rememberImport(resolveRegistryDir(), 'D:\\src\\x.jsonl', { kind: 'single', dshId: 'import-x', turns: 1, events: 6, sizeBytes: 1, version: 'v1', args: '[]', importedAt: T0, format: 'claude' })
 
   const { ctx } = makeCtx(persistence)
   apply(ctx)
   const value = await ctx.tools.registered('list_imported_sessions').execute({})
-  assert.equal(value.total, 0)
-  assert.deepEqual(value.sessions, [])
+  assert.equal(value.total, 1)
+  assert.equal(value.sessions[0].sessionId, 'import-x')
+  assert.equal(value.sessions[0].sourcePath, 'D:\\src\\x.jsonl')
+  assert.equal(value.sessions[0].importedAt, T0)
+  // 原生会话（registry 无记录、日志无标记）不出现
+  seedSession(persistence, { id: 'native-2', events: balancedEvents(null) })
+  const again = await ctx.tools.registered('list_imported_sessions').execute({})
+  assert.ok(!again.sessions.some((s) => s.sessionId === 'native-2'), '原生会话不出现')
 })
 
 test('list_imported_sessions：日志读不到时用 registry 兜底识别（读失败 ≠ 无标记）', async () => {
@@ -225,6 +254,9 @@ test('retract_import：移除 registry 记录、输出手动删除引导、零�
   assert.equal(value.wasRegistered, true)
   assert.match(value.manualDelete, /请手动删除工件目录 D:\\dsh-logs\\import-a\\session\.jsonl/)
   assert.match(value.manualDelete, /DSH 无 delete 面/)
+  // issue #22：撤回提示宿主内存索引可能残留幽灵会话，需重启彻底移除
+  assert.match(value.manualDelete, /重启 dsh/)
+  assert.match(value.manualDelete, /staleGhost/)
   assert.deepEqual(validateJsonSchemaValue(def.output.schema, value), [])
 
   // registry 记录被移除（重导不再幂等短路）
@@ -312,7 +344,7 @@ test('撤回后重导：registry 记录移除后，副本仍在 → backfill 回
   const persistence = makePersistence()
   const { ctx } = makeCtx(persistence, tree)
   apply(ctx)
-  const imp = ctx.tools.registered('import_claude')
+  const imp = chatDef(ctx)
 
   // 首次导入（建 registry 记录）
   const first = await imp.execute({ path: src })
@@ -335,6 +367,60 @@ test('撤回后重导：registry 记录移除后，副本仍在 → backfill 回
   assert.equal(again.status, 'imported')
   assert.equal(again.sessionId, 'import-sess-reimport-001')
   assert.ok(src in (await loadImports(resolveRegistryDir())).imports, '重导重新落 registry 记录')
+})
+
+test('撤回后重导：宿主残留幽灵会话（list 仍暴露、日志不可读）→ 自动另铸新 id 并报 staleGhost（issue #22）', async () => {
+  const src = 'D:\\demo\\reimport\\sess-ghost-001.jsonl'
+  const tree = { [src]: claudeTranscript('sess-ghost-001') }
+  const persistence = makePersistence()
+  const { ctx } = makeCtx(persistence, tree)
+  apply(ctx)
+  const imp = chatDef(ctx)
+  const first = await imp.execute({ path: src })
+  assert.equal(first.sessionId, 'import-sess-ghost-001')
+
+  // 撤回 + 用户按引导手动删工件；宿主内存索引仍保留该 id（list 返回、日志不可读）
+  await ctx.tools.registered('retract_import').execute({ sessionId: 'import-sess-ghost-001' })
+  persistence.ghost('import-sess-ghost-001')
+
+  const again = await imp.execute({ path: src })
+  assert.equal(again.status, 'imported')
+  assert.equal(again.sessionId, 'import-sess-ghost-001-1')
+  assert.deepEqual(again.staleGhost, { previous: 'import-sess-ghost-001', current: 'import-sess-ghost-001-1' })
+  // 幽灵原 id 仍在宿主 list（重启前不消失）；新副本真实落盘
+  assert.ok(persistence.sessions.has('import-sess-ghost-001'))
+  assert.ok(persistence.sessions.has('import-sess-ghost-001-1'))
+  // registry 指向新 id；再导（未变）幂等跳过
+  const reg = await loadImports(resolveRegistryDir())
+  assert.equal(reg.imports[src].dshId, 'import-sess-ghost-001-1')
+  const third = await imp.execute({ path: src })
+  assert.equal(third.status, 'already-imported')
+  assert.deepEqual(validateJsonSchemaValue(imp.output.schema, again), [])
+})
+
+test('撤回后重导：宿主 create 拒绝幽灵 id（list 已不暴露）→ 另铸新 id 重试并报 staleGhost（issue #22）', async () => {
+  const src = 'D:\\demo\\reimport\\sess-ghost2-001.jsonl'
+  const tree = { [src]: claudeTranscript('sess-ghost2-001') }
+  const persistence = makePersistence()
+  const { ctx } = makeCtx(persistence, tree)
+  apply(ctx)
+  const imp = chatDef(ctx)
+  await imp.execute({ path: src })
+  await ctx.tools.registered('retract_import').execute({ sessionId: 'import-sess-ghost2-001' })
+  // 宿主病态：list 已不暴露幽灵，但 create 仍对原 id 抛 already exists
+  //（真实 DSH 0.1.1-rc.2：内存索引残留，无 delete/forget 面）
+  persistence.hostReject('import-sess-ghost2-001')
+
+  const again = await imp.execute({ path: src })
+  assert.equal(again.status, 'imported')
+  assert.equal(again.sessionId, 'import-sess-ghost2-001-1')
+  assert.deepEqual(again.staleGhost, { previous: 'import-sess-ghost2-001', current: 'import-sess-ghost2-001-1' })
+  // registry 指向新 id（不是幽灵原 id），下次导入幂等短路
+  const reg = await loadImports(resolveRegistryDir())
+  assert.equal(reg.imports[src].dshId, 'import-sess-ghost2-001-1')
+  const third = await imp.execute({ path: src })
+  assert.equal(third.status, 'already-imported')
+  assert.deepEqual(validateJsonSchemaValue(imp.output.schema, again), [])
 })
 
 // ── removeImport 单元 ──────────────────────────────────────────

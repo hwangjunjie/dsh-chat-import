@@ -123,12 +123,10 @@ test('convertHermesJson: 中间 JSON 问答、元数据、平衡回合', () => {
   assertBalanced(out)
   const types = out.events.map((e) => e.type)
   assert.deepEqual(types, [
-    'session/imported', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end', 'session/title',
+    'user/message', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end', 'session/title',
   ])
-  const imported = out.events[0]
-  assert.equal(imported.data.tool, 'hermes')
-  assert.equal(imported.data.sourceId, 'hm-a')
-  assert.equal(imported.data.sourcePath, 'E:/demo/hermes/state.db')
+  // 导入归属外置 registry（issue #34）：日志无 session/imported 标记
+  assert.ok(out.events.every((e) => e.type !== 'session/imported'))
   const asst = out.events.find((e) => e.type === 'assistant/message').data.message
   assert.deepEqual(asst.source, { kind: 'model', provider: 'hermes', model: 'hermes' })
   assert.equal(out.events.find((e) => e.type === 'session/title').data.title, 'Fix hermes build')
@@ -172,7 +170,7 @@ test('convertHermesJson: thinking→reasoning、tool_use/tool_result 成对、is
   assert.equal(results[0].data.message.content[0].content[0].text, 'all passed')
   assert.equal(results[1].data.message.content[0].isError, true)
   // 工具结果独占的 user 消息不开新轮；thinking → reasoning 进 assistant content
-  assert.equal(out.events.filter((e) => e.type === 'user/message').length, 1)
+  assert.equal(out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user').length, 1)
   const asst = out.events.find((e) => e.type === 'assistant/message').data.message
   const kinds = asst.content.map((c) => c.type)
   assert.ok(kinds.includes('reasoning'))
@@ -238,7 +236,7 @@ test('convertHermesJson: JSONL flat 形态（role/content/ts）平衡会话、�
   assert.equal(out.events.find((e) => e.type === 'session/title'), undefined) // 兜底标题不钉
   assert.ok(out.meta.id.startsWith('import-'))
   assert.equal(out.meta.createdAt, 1700000000000) // 秒级 ts → 毫秒
-  const users = out.events.filter((e) => e.type === 'user/message')
+  const users = out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user')
   assert.equal(users.length, 1)
   assert.equal(users[0].data.content[0].text, '什么是 Rust？')
 })

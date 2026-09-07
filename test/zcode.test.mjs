@@ -127,21 +127,29 @@ function makeCtx(tree = {}) {
   return { ctx, persistence, attached, registered }
 }
 
-function registeredDef(ctx, toolName = 'import_zcode') {
+function registeredDef(ctx, toolName) {
   return ctx.tools.registered(toolName)
 }
 
-// REQ-32：导入会话日志首事件为 session/imported 标记（seq 0、ignorable）。
-function assertImportedMarker(events, { tool, sourceId, sourcePath }) {
-  const ev = events[0]
-  assert.equal(ev.type, 'session/imported')
-  assert.equal(ev.seq, 0)
-  assert.equal(ev.ignorable, true)
-  assert.equal(ev.data.tool, tool)
-  assert.equal(ev.data.sourceId, sourceId)
-  assert.equal(ev.data.sourcePath, sourcePath)
-  assert.equal(typeof ev.data.importedAt, 'number')
-  assert.ok(ev.data.importedAt > 0)
+// 辅助：import_chat 分发器定义——execute 时注入 format（等价旧 import_zcode）
+function chatDef(ctx, format = 'zcode') {
+  const tool = registeredDef(ctx, 'import_chat')
+  return { ...tool, execute: (args) => tool.execute({ format, ...args }) }
+}
+
+// 导入归属外置 registry（issue #34）：0.8.3 起日志不再写 session/imported 标记，
+// 事件 envelope 键收敛在宿主白名单内（type/seq/time/data/surfaceOp/sourceEventSeqs）。
+function assertEnvelopeHygiene(events) {
+  assert.ok(events.every((e) => e.type !== 'session/imported'), '日志不得含 session/imported 标记')
+  const ALLOWED = new Set(['type', 'seq', 'time', 'data', 'surfaceOp', 'sourceEventSeqs'])
+  for (const e of events) {
+    for (const key of Object.keys(e)) {
+      assert.ok(ALLOWED.has(key), '事件 envelope 出现白名单外键: ' + key)
+    }
+    assert.equal(typeof e.seq, 'number')
+    assert.equal(typeof e.time, 'number')
+    assert.notEqual(e.data, undefined)
+  }
 }
 
 // ── 合成 zcode db fixture（真实 schema：session 主会话 parent_id IS NULL；
@@ -278,10 +286,10 @@ test('convertZcodeJson: 简单问答、元数据、平衡回合', () => {
   assert.equal(out.meta.cwd, 'E:/demo/zcode')
   assert.equal(out.meta.createdAt, 1786000000000)
   assert.equal(out.title, 'Fix zcode build')
-  assertImportedMarker(out.events, { tool: 'zcode', sourceId: 'zcs-a', sourcePath: 'E:/demo/zcode/db.sqlite' })
+  assertEnvelopeHygiene(out.events)
   const types = out.events.map((e) => e.type)
   assert.deepEqual(types, [
-    'session/imported', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end', 'session/title',
+    'user/message', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end', 'session/title',
   ])
   out.events.forEach((e, i) => assert.equal(e.seq, i))
   for (const e of out.events.filter((e) => e.type === 'user/message' || e.type === 'assistant/message' || e.type === 'tool/result')) {
@@ -359,7 +367,7 @@ test('convertZcodeJson: <system-reminder> 注入 user 消息整条过滤', () =>
   })
   const out = convertZcodeJson(raw)
   assert.equal(out.turns.length, 1)
-  const users = out.events.filter((e) => e.type === 'user/message')
+  const users = out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user')
   assert.equal(users.length, 1)
   assert.equal(users[0].data.content[0].text, '真实提问')
 })
@@ -499,7 +507,7 @@ test('import_zcode 单库文件：批量形态、逐会话落盘、schema 校验
   const dbPath = makeZcodeDb(zcodeTestSessions())
   const { ctx, persistence, attached } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_zcode')
+  const def = chatDef(ctx, 'zcode')
   const value = await def.execute({ path: dbPath })
 
   assert.equal(value.mode, 'batch') // 单 .db 也恒批量
@@ -516,7 +524,7 @@ test('import_zcode 单库文件：批量形态、逐会话落盘、schema 校验
   assert.equal(savedA.meta.createdAt, 1786000000000)
   assert.equal(savedA.events.at(-1).type, 'session/title')
   assert.ok(savedA.events.every((e, i) => e.seq === i))
-  assertImportedMarker(savedA.events, { tool: 'zcode', sourceId: 'zcs-a', sourcePath: dbPath })
+  assertEnvelopeHygiene(savedA.events)
   // tool/call + tool/result 关联落盘
   const call = savedA.events.find((e) => e.type === 'tool/call')
   const result = savedA.events.find((e) => e.type === 'tool/result')
@@ -539,7 +547,7 @@ test('import_zcode 目录模式：自动定位 db.sqlite、schema 校验', async
   const dirPath = dirname(dbPath)
   const { ctx, persistence } = makeCtx({ [dirPath]: 'dir' }) // stat 命中 → 目录分支
   apply(ctx)
-  const def = registeredDef(ctx, 'import_zcode')
+  const def = chatDef(ctx, 'zcode')
   const value = await def.execute({ path: dirPath })
 
   assert.equal(value.mode, 'batch')
@@ -562,7 +570,7 @@ test('import_zcode zcode:// 伪路径：走默认库只导该会话、幂等', a
   try {
     const { ctx, persistence } = makeCtx({})
     apply(ctx)
-    const def = registeredDef(ctx, 'import_zcode')
+    const def = chatDef(ctx, 'zcode')
     const value = await def.execute({ path: 'zcode://zcs-a' })
 
     assert.equal(value.mode, 'batch')
@@ -574,7 +582,7 @@ test('import_zcode zcode:// 伪路径：走默认库只导该会话、幂等', a
     const saved = persistence.sessions.get('import-zcs-a')
     assert.ok(saved)
     // 幂等键 = 伪路径原始字符串（fs.resolve 会归一化掉 '://' 前缀，不能用 displayPath）
-    assertImportedMarker(saved.events, { tool: 'zcode', sourceId: 'zcs-a', sourcePath: 'zcode://zcs-a' })
+    assertEnvelopeHygiene(saved.events)
     assert.equal(persistence.sessions.size, 1)
 
     // 幂等：重导同一伪路径 → already-imported
@@ -594,7 +602,7 @@ test('import_zcode compaction：摘要还原为上下文 reasoning、0 skipped',
   const dbPath = makeZcodeDb([zcodeCompactedSession()])
   const { ctx, persistence } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_zcode')
+  const def = chatDef(ctx, 'zcode')
   const value = await def.execute({ path: dbPath })
 
   assert.equal(value.mode, 'batch')
@@ -611,14 +619,14 @@ test('import_zcode compaction：摘要还原为上下文 reasoning、0 skipped',
   assert.equal(reasoning[0].text, '此前对话的压缩摘要。')
   // compaction 结构块不产生内容；摘要消息不产生空回合
   assert.ok(!saved.events.some((e) => e.data && e.data.message && e.data.message.content.some((c) => c.type === 'compaction')))
-  assert.equal(saved.events.filter((e) => e.type === 'user/message').length, 1)
+  assert.equal(saved.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user').length, 1)
 })
 
 test('import_zcode sessionIds 过滤：只导指定源会话', async () => {
   const dbPath = makeZcodeDb(zcodeTestSessions())
   const { ctx, persistence } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_zcode')
+  const def = chatDef(ctx, 'zcode')
   const value = await def.execute({ path: dbPath, sessionIds: ['zcs-b'] })
 
   assert.equal(value.mode, 'batch')
@@ -634,7 +642,7 @@ test('import_zcode 幂等：重复导入同一库只落盘一次', async () => {
   const dbPath = makeZcodeDb(zcodeTestSessions())
   const { ctx, persistence } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_zcode')
+  const def = chatDef(ctx, 'zcode')
   const first = await def.execute({ path: dbPath })
   const second = await def.execute({ path: dbPath })
 
@@ -648,7 +656,7 @@ test('import_zcode db 缺失回退 transcript.jsonl：不报错、0 skipped', as
   const { txPath } = writeZcodeTranscript()
   const { ctx, persistence } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_zcode')
+  const def = chatDef(ctx, 'zcode')
   const value = await def.execute({ path: txPath })
 
   assert.equal(value.mode, 'batch')
@@ -661,9 +669,9 @@ test('import_zcode db 缺失回退 transcript.jsonl：不报错、0 skipped', as
   const saved = persistence.sessions.get(sid)
   assert.ok(saved)
   assert.equal(saved.meta.cwd, 'E:/demo/zcode-old') // metadata.json 的 cwd
-  assertImportedMarker(saved.events, { tool: 'zcode', sourceId: basename(dirname(txPath)), sourcePath: txPath })
+  assertEnvelopeHygiene(saved.events)
   // 注入 user 被过滤（不产生回合）；工具调用成对
-  assert.equal(saved.events.filter((e) => e.type === 'user/message').length, 1)
+  assert.equal(saved.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user').length, 1)
   const call = saved.events.find((e) => e.type === 'tool/call')
   const result = saved.events.find((e) => e.type === 'tool/result')
   assert.equal(call.data.name, 'search_files')
@@ -678,6 +686,6 @@ test('import_zcode db 缺失回退 transcript.jsonl：不报错、0 skipped', as
 test('import_zcode 读不到 DB：失败大声抛错', async () => {
   const { ctx } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_zcode')
+  const def = chatDef(ctx, 'zcode')
   await assert.rejects(() => def.execute({ path: join(tmpdir(), 'no-such-zcode.db') }))
 })

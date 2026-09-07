@@ -7,9 +7,324 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 Every entry maps to commits in the repository history
 (`git log --oneline --no-decorate`); the 0.1.0 boundary is anchored to the first
 npm publish timestamp (cross-checked with `npm view dsh-chat-import time`).
-Release dates are the npm publish timestamps in Asia/Shanghai (UTC+8).
+Release dates are the npm publish timestamps in Asia/Shanghai (UTC+8). Every
+version is also published as a GitHub Release (tag `vX.Y.Z`), with notes taken
+from the matching section below.
 
 ## [Unreleased]
+
+## [0.10.0] - 2026-09-06
+
+### Added
+
+- **整合 dsh-better-sidebar：安装后「导入会话」注册为侧边栏 tab（可选 peer + 回退）** — 检测到 `ctx.betterSidebar` 服务时，把「导入会话」面板注册为该侧边栏的单一 tab（`registerTab`，导入/历史两个子视图内聚为一个 tab）；footer「导入会话」按钮点击改为 `openTab`（新开/聚焦 tab 并展开侧边栏面板）。未安装 better-sidebar 时按钮保持自绘滑出面板回退，行为不变。
+- **导入面板 UI 对齐 DSH 设计规范** — 圆角统一到 8px（输入/按钮/列表项）与 12px（卡片/对话框），字号收敛到 13/12/11 三级（消除 12.5/11.5/10px 等非标字号）；列表项的「最后活跃 / 导入时间」改为相对时间显示（刚刚 / N 分钟前 / N 小时前 / N 天前，超 7 天回退绝对时间，hover 显示精确时间）。
+- **导入面板窄宽度自适应（侧边栏可拖宽）** — 面板宽度低于 400px 时：工具栏「全选 / 清空 / 刷新 / 仅选未导入 / 仅选已导入」与分页「上一页 / 下一页」降级为内联 SVG 图标（title/aria-label 保留文字说明）、页码压缩为「当前页/总页」、搜索与清除按钮只留图标；宽度 ≥ 400px 保持原文字形态，行为不变。
+- **多选复选框替换为来源 Agent 徽标（LobeHub icons）** — 列表项前的原生 checkbox 改为白色圆角卡 + 品牌标：从 LobeHub 官方图标库（`@lobehub/icons-static-svg`）内联 Claude Code / Codex / Cursor / OpenCode / Kilo Code / Grok / Pi / Qwen / ChatGPT / OpenClaw / Qoder / Hermes / Kimi 的品牌标（Kimi 按品牌惯例用黑色底），Gemini / DeepSeek 用 simple-icons 品牌路径，Reasonix（`esengine/DeepSeek-Reasonix` 蓝色符号）与 MiMo Code（`XiaomiMiMo/MiMo-Code` 深底 M 标）从各自仓库内联，ZCode（`zcode.z.ai` 深底白 Z 标）与 WorkBuddy（theSVG 官方图标）亦内联，19 个来源全部有品牌标；未选中只显徽标，选中时叠加半透明主题强调色遮罩 + 带环 tick（环/勾随主题文字色），保留 role=checkbox 与键盘切换的可访问性；来源文本框（itemMeta 里的 format 徽章）不再显示。
+
+### Fixed
+
+- **工作区分组头 sticky 与列表顶缘对齐** — 列表容器顶部不再留 8px padding，分组头 `position: sticky; top: 0` 时背景完整贴合列表顶缘，滚动时不再在顶部露出缝隙、泄漏列表背后的会话信息（历史面板单独补回顶 padding，外观不变）。
+- **已导入会话不再重复显示两个「已导入」** — 列表项右侧的 `importedTag` 徽标与 itemMeta 里的状态徽标重复，删除前者，仅保留状态徽标 + 同步按钮。
+- **导入面板按钮精简** — 删除「搬空当前筛选 / 刷新已导入 / 搬空全部」三个作用易混淆的批量按钮（及其确认对话框），改为在工具栏「全选 / 清空 / 刷新」后新增「仅选未导入」「仅选已导入」两个批量勾选按钮，配合「导入所选」完成批量导入/增量同步，交互更直白。
+- **侧边栏「导入会话」按钮与 dsh-cost-meter 费用卡同槽被挤成窄条** — `footerOccupantRect()` 的整行占用者白名单新增 `dsh-cost-meter` 的侧栏费用卡根元素（`.cm-footer-stack`，`flex-direction:column; width:100%`）：检测到费用卡后按钮改为浮到其上方独占一行，不再被压成窄条/截断（与 cordis 徽标 / 插件市场 launcher / usage-billing 计费卡同款处理）。
+- **「导入会话」按钮样式对齐侧边栏「设置」按钮** — 宽态改对齐官方设置按钮几何（`height: 42px`、`padding: 0 10px 0 8px`、`overflow: hidden`、`font-family: inherit`），rail 态图标对齐 18px：此前 `height: 34px`、`padding: 6px 2px 6px 10px` 与设置按钮不一致。
+
+## [0.9.1] - 2026-09-06
+
+### Added
+
+- **Kilo Code 导入支持（issue #36）** — 新增 `kilocode` 源，原生只读 Kilo Code 本地 SQLite 历史库（`~/.local/share/kilo/kilo.db`，开发频道 `kilo-<channel>.db` / 旧版 `opencode-<channel>.db` 可经 `path` 指定）：session/message/part 三表 schema 是 opencode 的超集（多出 `parent_id` / `time_archived` / `slug` 等列，核心对话列同构），读取/导入/预览完全复用 opencode 管线（`readOpencodeDb` / `importOpencodeFile`），provider 标签为 `kilocode`；默认跳过子会话（`parent_id` 非空）与已归档会话（`time_archived` 非空），只导主会话。发现层 `scan_discover` 默认根 `~/.local/share/kilo`，面板「Kilo Code」来源与 `import_chat({ format: 'kilocode' })` 同步可用。
+
+### Fixed
+
+- **侧边栏「导入会话」按钮与 usage-billing 计费卡同槽被挤成窄条（issue #35）** — `footerOccupantRect()` 的整行占用者白名单新增 `@kenz1117/dsh-ui-usage-billing` 计费卡触发器（`[data-testid='billing-trigger']`），并把 `data-testid` 加入 MutationObserver 的 `attributeFilter`：检测到计费卡后按钮改为浮到其上方独占一行，不再被压成窄条/截断。
+
+## [0.9.0] - 2026-09-04
+
+### Added
+
+- **设置页新增「将本插件工具显式注入对话上下文」开关（默认开）** — `chat-import` 设置命名空间新增 `injectTools`（默认 `true`）：关闭后不再向对话内的 Agent 注入本插件的 13 个工具（可节省约 5k 上下文），导入/导出/发现/撤回等仍可通过 GUI「导入会话」面板与 `/import` 命令完成。工具注册改为响应式：`registerTools` 返回 `reconcile`，`registerImportPrefs` 在 settings 就绪/变化时驱动注销/重注册；面板与命令依赖的 `IMPORT_SPECS` 恒被填充，不受注入开关影响。
+
+### Changed
+
+- **上下文注入正文按 dsh 惯例包 `<system-reminder>` 信封** — 环境变更声明与（开关开启时）原始系统提示词整体包进 `<system-reminder>` 信封（OPEN / 正文 / CLOSE 逐行拼接），声明改英文；源提示词内的字面 `</system-reminder>` 转义为 `<\/system-reminder>`，防止源提示词提前闭合信封。
+
+### Fixed
+
+- **双向同步入站导入遵循 `importSystemPrompt` 开关** — 入站巡检 / 同步导入此前未读 `chat-import` 偏好、始终按默认注入系统提示词；现与工具 / 面板同口径读取 `importSystemPrompt`，关闭时仅保留环境变更声明。
+
+## [0.8.3] - 2026-09-01
+
+### Added
+
+- **docs: 与 dsh-movein 首次迁移指南互链（discussion #32）** - README（双语）新增「配套工具：配置迁移」
+  一节：明确分工（本插件管会话历史、dsh-movein 管配置，可按需单独使用），声明组合流程尚未联合验证、
+  互链不构成互相背书。`import_agents` 定位为轻量资产搬移（USAGE 双语补 scope note，完整配置迁移指向
+  dsh-movein）。USAGE 顶部新增「首次迁移分步流程」：预览（`scan_discover` / 面板 / `preview: true`）->
+  导入（核对逐会话 `status`）-> 体检与撤回（`doctor` / `retract_import` / 历史）。ROADMAP 生态条目
+  升级为指南链接。
+
+### Changed
+
+- **Reasonix recovery lineage aggregation** — Reasonix directory imports now default to a conservative `lineageMode: 'canonical'`: a recovery ancestor is collapsed only when modern sidecar metadata, an explicit `parent_id` chain, and a strict semantic prefix jointly prove coverage. Malformed, WAL-backed, duplicate, ambiguous, and genuinely divergent transcripts remain independent; `lineageMode: 'physical'` preserves the previous one-JSONL-per-session behavior.
+
+### Fixed
+
+- **导入会话在 dsh ≥ 0.1.2-alpha 上无法打开（issue #34）** — dsh 0.1.2-alpha 起读取路径按
+  fail-closed 事件词汇表（生成式类型白名单 + envelope 键白名单）拒绝加载含未知事件的日志；
+  本插件 0.8.2 及以前在日志头写入的自产 `session/imported` 标记（含 `ignorable` 键）恰在
+  词汇表外，导致该引擎上所有导入会话点开即报 unknown event type / invalid envelope。修复：
+  - **日志不再写标记**——导入归属（REQ-32）以 imports registry 为权威：`list_imported_sessions` /
+    `retract_import` / `sync_to_claude` / `export_chat` 与面板历史、撤回全部改为 registry 反查，
+    旧日志标记降级为兜底证据；registry 记录新增 `format` 字段供出站同步判定来源格式。
+  - **dsh 源导入 / bundle 恢复净化旧日志**——过滤历史标记事件、剥离词汇表外 envelope 键、
+    seq 密集重排且 `sourceEventSeqs` 引用同步重映射；顺带修复 dsh 路径此前整段丢弃
+    `sourceEventSeqs` 的既有缺陷（tool/result 与 tool/call 关联在重导后恢复）。
+  - **存量会话修复路径**——0.8.2 导入的会话在导入面板点「刷新已导入」（从源重新转换、
+    同 id 覆盖）即可修复；`doctor` 新增 legacy 标记检测并输出修复指引。
+  - 局限：源文件已删除的存量会话无法重转修复（可 `retract_import` 清理）。
+
+## [0.8.2] - 2026-08-29
+
+### Added
+
+- **千问办公（qwen）导入支持（PR #30，xianrui69 贡献）** — 第 19 个导入来源：`import_chat`
+  新增 `qwen` 格式、`scan_discover` / 导入面板 / `/import` 全链路接线。千问办公每个会话
+  一个转写 `~/.qwenworkcn/projects/<slug>/<session-uuid>.jsonl`，明文 JSON Lines、事件
+  词汇与 Claude Code transcript 同构（text / thinking / tool_use / tool_result 块、
+  uuid/parentUuid、timestamp、gitBranch）。千问特有差异逐项处理：人类真实原话取
+  `user.humanInput.text`（`message.content` 的 text 块被 `<system-reminder>` 等系统上
+  下文包裹，`<system` 开头的块跳过）；`workspace-directories` 里非 `.qwenworkcn` 的目录
+  才是用户真实项目文件夹（slug 目录名是存储层混写、禁作项目，会话 cwd/项目取自它）；
+  `runtime-config` 提供模型；同会话双 slug 副本由发现层按 sessionId 去重留最新；路径签
+  名自拒（非 `~/.qwenworkcn/projects` 布局直接返回空）。转换与 claude 转换器同款纪律
+  （一条 assistant = 一步，`tool_result` 按 `tool_use_id` 挂回声明 step）。README 双语
+  与 `import_chat` 格式计数同步 18 → 19。
+
+- **导入面板来源 / 工作区下拉改可搜索（PR #30）** — 来源与工作区下拉换自定义可搜索
+  combobox：输入即过滤、选中项 ✓ 高亮、键盘上下 / 回车导航，明暗主题跟随侧边栏；来源
+  列表项附产品名标签。取代原生 `select`（选项多时无法检索）。
+
+- **导入面板「刷新已导入」** — 按当前来源 + 工作区 + 搜索条件，对已导入会话重新转换并
+  覆盖（`replace:true`，同 session id，不新建副本）；确认框显示条数。
+
+- **统一导入标题「来源 · 话题」** — 全源导入后钉住 `session/title`（如 `Cursor · 首问`）；
+  话题未知时为 `来源 · 未命名 · 日期`，不再回退为工作区目录名。
+
+### Fixed
+
+- **Cursor 导入会话无法打开** — 同一步多个 `tool_use` 不再生成重复 `callId`（如
+  `cursor-1-1`），避免 DSH 历史加载报 `more than one start Match`；用户正文剥离
+  `<timestamp>` / `<user_query>` 扫描包裹。
+
+- **导入撤回 / 刷新已导入在会话工件被占用时中止并保留 registry** — `rm` 后目录仍存在
+  （文件被占用 / 权限拒绝）视为删除失败并抛错：撤回中止后不清 registry、刷新中止后不重导，
+  防止留下插件再也管不到的幽灵会话。`locate` 定位缺失时改为走扫描兜底，防陈旧定位漏删
+  真实工件。
+
+- **导入面板下拉按 Esc 收起不再连带关闭整个面板** — 可搜索下拉的 document 级 Escape
+  处理补 `stopPropagation`：面板的 Esc 关闭监听挂在 window 上，同一事件先 document 后
+  window 两个监听都会触发（原生 select 弹层吞按键，故旧版无此问题）。
+
+- **侧栏底部「导入会话」按钮在 wide 模式独占整行，把同槽其它插件入口挤出侧栏被裁（#31）** — 非浮动
+  行内样式按槽容器 flex 布局三分派：row 容器（默认 footer 行）改 `flex: 1 1 auto + width: auto +
+  min-width: 0`，与同槽其它入口（如 dsh-web-all 的「检查更新 / 远程访问」）共享一行，仅本插件一个
+  入口时 `flex-grow` 仍撑满整行、视觉不变；column 容器（usage-stats 强制纵排，#25）与 wrap 容器
+  （tokenledger 注入 flex-wrap）保持 `flex: 0 0 auto + width: 100%` 不回归；rail 态恒为 36×36 圆
+  钮。探测函数 `footerWraps` 扩为 `footerLayout`（一次读取 `flex-wrap` + `flex-direction`）。
+
+## [0.8.1] - 2026-08-28
+
+### Added
+
+- **导入面板工作区下拉筛选** — 来源旁新增「工作区」下拉，选项来自当前扫描结果的真实目录名（含「无工作区」桶）；与搜索 AND 组合，全选/搬空计数随筛选变化。
+- **导入面板「搬空当前筛选」** — 仅导入当前来源 + 工作区 + 搜索条件下的未导入会话（确认框提示条数）；全局「搬空全部」保留。
+- **导入面板扫描提示** — 刷新/首扫显示耗时预期与进度（缓存命中几秒、首次全量可能较慢）；主要控件补充 title 说明。
+- **导入面板分页大小可选 50 / 100 / 500** — 底部分页条新增「每页」下拉，翻页仍为零重扫客户端切片。
+- **导入面板「搬空全部」** — 扫描完成后一键导入当前结果中全部未导入会话（跨页，非仅当前页）。
+- **导入面板「历史」页** — 读取 `~/.dsh/dsh-chat-import/imports.json` 展平展示来源路径、会话 ID、导入时间与轮次/事件计数。
+- **导入历史一键删除** — 支持单条或全部撤回：删除本插件创建的 DSH 会话工件、解挂工作区、清理空壳工作区（`agent-transcripts/<uuid>` / dedicated 专用目录），并从 registry 移除记录；操作前需确认。
+
+### Changed
+
+- **导入会话面板改为后台扫描 + 逐条流式加载** — 面板数据源 `POST /api-import/sessions`
+  新增流式模式（body 带 `after` 游标）：发现按「来源|关键词|路径|epoch」键后台
+  singleflight 扫描（epoch 由客户端每次刷新 / 导入后自增 → 新扫描键强制重扫），
+  `discoverSessions` 新增可选 `onEntry` 逐条产出钩子（importStatus / git 状态标注与
+  查询过滤移到产出路径，缺省行为零变化）；客户端按 ~250ms 轮询游标增量，会话按发现
+  顺序**逐条插入列表**——首屏不再被全量扫描阻塞，换页 / 翻页不再触发重扫（旧契约
+  offset/limit 分页路由保留兼容）。jsonl 型来源（claude/codex/cursor/gemini/…）逐会话
+  产出；SQLite 型来源（opencode/mimocode/zcode/hermes/chatgpt）仍整库一批。
+
+- **导入面板无 cwd 分组显示为「无工作区」** — 替代原「(未分组)」，对齐 Cursor empty-window / 数字 id 等场景。
+
+- **导入会话面板工作区分组改按活跃度排序** — 分组从「工作区名首字母升序」改为「组内
+  最新会话的最后编辑时间降序」：最近活跃的工作区置顶（时间并列按工作区名升序稳定），
+  组内会话保持最后编辑时间降序，未分组桶仍钉在最后。
+
+- **双向同步控制台迁入设置页「会话导入」分区** — 同步状态与启停并入「会话导入」设置
+  分区（横线分隔，控件风格对齐设置页），导入面板移除独立同步页签；`/api-import/sync`
+  路由与巡检行为不变。
+
+### Fixed
+
+- **Cursor 导入面板按真实工作区分组** — Cursor `projects/<slug>` 将路径分隔符与 `.` 均编码为
+  `-`（如 `Funion.Client-develop` → `Funion-Client-develop`）。扫描与导入现经
+  `workspace.json` / `workspaceRegistry` 正向匹配 + 磁盘贪心解码还原真实 `cwd`，面板分组
+  显示人类可读目录名（保留点号）；`empty-window`、纯数字项目 id 等无仓库 slug 不再误建
+  异类工作区。导入 `agent-transcripts/<uuid>` 布局时 `meta.cwd` 指向解码后的项目根，而非
+  UUID 父目录。首条 user 文本中的 `<timestamp>…</timestamp>` 解析为 `createdAt` /
+  `lastActiveAt`（无则回退文件 mtime），修复面板「时间未知」。**scan-cache 书签命中时**
+  对旧 cursor 条目做读时补丁（slug 解码 + 时间戳补全）并写回，无需 bump 版本或重读 jsonl。
+
+- **侧边栏「导入会话」按钮注册改用 `slots.inject` 等待槽声明就绪** — 裸
+  `ctx.slots.register("sidebar.footer.action", …)` 要求该槽在 apply 期已被 ui-sidebar
+  声明；DSH Desktop 增强模式下桌面 shell 的声明时序不保证先于本插件，注册当场抛错使
+  客户端 fiber 失败、渲染器 boot 判失败（白屏失败页，仅增强模式复现）。改用
+  `slots.inject("sidebar.footer.action", …)` 挂起等待声明就绪（官方 ui-cordis 与
+  dsh-community-market 同款写法），注册不再依赖激活顺序。设置页分区的 settingsScope
+  解析同步挪进 `slots.inject` 回调内（apply 期该可选服务尚未就绪）。
+
+- **`ctx.inject(['settings'])` 注册偏好命名空间不再把 `settings.register` 的 owner scope
+  作为回调返回值** — cordis 的 effect 契约只接受函数/可空/thenable/可迭代，普通对象会抛
+  `TypeError: Invalid effect` 并使整个插件 apply 失败：桌面宿主中 settings 服务就绪早、
+  回调同步执行即触发，表现为 DSH Desktop 启动崩溃（web/headless 下 settings 缺席或晚到、
+  回调不执行所以不受影响）。register 内部已自行把命名空间生命周期挂到插件 fiber，回调
+  空返回即可；`test/index.test.mjs` 的 `makeCtx.inject` 同步补上同款 effect 校验，同类
+  回归会在单测中直接暴露。
+
+- **设置页「导入系统提示词」开关改走插件自有 fenced 路由（`/api-import/prefs`）** —
+  DSH 配置客户端（settingsScope）只能读写 api-proxy 暴露白名单内的命名空间，插件自有
+  `chat-import` 不在其列：此前开关读不到值、写入被拒（点不动、不持久化）。现客户端
+  经面板 fenced 路由进程内读写设置 seam（`describe` / `update`，`expectedRevision`
+  冲突保护），settings 服务缺席时回退默认、开关照常渲染；宿主侧命名空间注册改
+  `ctx.inject(['settings'])` 惰性挂载（对齐 dsh-better-sidebar 的 `settingsGet` /
+  `settingsUpdate` 模式）。
+
+- **设置页「会话导入」分区迁移到正确的宿主 Hook（`settings.section` 左导航页）** —
+  此前注册在 `settings.plugins.tab`（「插件」分区内部的子 TAB），不符合该插槽语义
+  （它是分区内页面，不是插件设置入口），部分宿主版本下点不开。现改为注册
+  `settings.section`（设置页左侧导航的「每功能一页」，`agent-presets` 等官方插件
+  同款做法），「导入系统提示词」开关作为独立的「会话导入」设置页呈现。
+
+- **面板后台扫描不再阻塞宿主 Web 服务事件循环** — 后台扫描跑在宿主进程上，此前
+  `gitStatusOf`（`statSync` / `readFileSync` 逐目录上探 .git）与 `scanDsh` 的 zstd
+  `readFileSync` 会在扫描期间同步占住事件循环，周期性冻住面板轮询与其它 UI 请求
+  （表现为整个界面卡顿）。现全部改为 `fs/promises` 异步（含逐条产出 await 让出）：
+  扫描期间事件循环持续可用。客户端轮询同步加渲染守卫——空轮询不再触发 setStream
+  重渲染。SQLite 型整库读取器（opencode/mimocode/zcode/hermes/chatgpt）仍为同步
+  实现，属已知局限。
+
+## [0.8.0] - 2026-08-26
+
+### Added
+
+- **WorkBuddy（腾讯 AI 编码应用）导入支持** — 新增 `import_workbuddy` 工具与
+  `workbuddy` 格式。WorkBuddy 每个会话一个 transcript
+  `~/.workbuddy/projects/<project-hash>/<session-uuid>.jsonl`，逐行事件 JSON：
+  `message`（user 提问从 `<user_query>` 提取、assistant 文本）、`reasoning`、成对
+  `function_call` / `function_call_result`（按 `callId` 配对，孤儿/打断草稿丢弃）、
+  运行期 `file-history-snapshot` 跳过。`scan_discover` 默认扫
+  `~/.workbuddy/projects`，标题取首条真实提问（注入过滤），cwd 取记录内值；
+  `FORMATS` / `/import` 来源名 / 面板 / `index.d.ts` 全链路接线。
+
+### Changed
+
+- **审计清理（docs/unnecessary-code-audit.md A 级 + B 级部分）** — 同步元数据漂移：
+  三处过时计数注释（`discovery.mjs`「13 种」→「17 种」、`convert/core.mjs` 源枚举
+  「13」→「18」、`panel.mjs`「15 个」→「18 个」）；`index.d.ts` `ToolSurface` 补
+  `doctor` / `import_mcp` / `import_settings` 三接口（此前声明 10 个、实际注册 13 个）、
+  `ScanFormat` 补 `'mimocode'`（此前 16 项、FORMATS 17 项）；`AGENTS.md` 布局表补
+  tools.mjs / restore.mjs / verify.mjs / agents.mjs / mcp.mjs / settings.mjs /
+  doctor.mjs / cwd-map.mjs / handoff.mjs / resume-command.mjs / markdown.mjs /
+  import-prefs.mjs / mimocode.mjs / dsh.mjs 与 export/ 的 kimi.mjs / bundle.mjs，
+  `files` 白名单描述改 `docs/*.md` + `bin`，质量约定 host 面模块白名单补全
+  （import-prefs 等）；`ROADMAP.md` 来源数「14 源 + 本地 JSONL（15 工具）」→
+  「17 源 + 本地 JSONL（13 工具）」、REQ-09 工具名 → `makeImportChatTool`。
+  删除零消费者死 re-export `tailCodexEvents` / `tailGrokbuildEvents`
+  （lib/export/codex.mjs / grokbuild.mjs + export.mjs shim，审计 §1.5）。
+
+- **`export_claude` / `export_codex` / `export_kimi` 三合一为 `export_chat({ format, ... })`
+  （注册工具 15 → 13）** — 三个反向导出工具参数面完全相同（sessionId / path /
+  outputDir / dryRun），收敛为单一分发器，`format` 为 3 值 enum（claude / codex / kimi）。
+  执行体（exportClaudeSession / exportCodexSession / exportKimiSession）与输出 schema
+  契约不变：claude 分支保留 cwd / mapping / slug / title，codex/kimi 分支保留
+  toolCalls / toolResults；`sync_to_claude` 的 `target:'copy'` 语义不变（写回
+  `export_chat format=claude` 导出的副本）。每请求工具 schema 再降：export 面从
+  3 份重复参数/描述合并为 1 份。
+
+- **全部 13 个工具 description 英文化并重写（对齐宿主 DSH 英文工具面 + 官方
+  function-calling 最佳实践）** — 宿主 system prompt 与 20 个内置工具均为英文，
+  本插件此前是中文孤岛；现按 [Anthropic tool-use 建议](https://github.com/anthropics/skills/blob/main/skills/claude-api/shared/tool-use-concepts.md)
+  为每个工具级描述补充「何时调用」触发条件，并**移除 description 中的开发侧注解**
+  （REQ-NN 编号 / issue 编号 / 同类生态插件对标）——
+  这些对模型与最终用户都是零信息量噪声。修正 `scan_discover` 描述过时计数
+  「15 种」→「17 种」并补全枚举（mimocode / workbuddy）。参数与 format enum 描述
+  同步英文化；工具描述是产品文案（模型上下文 + 用户可见），内部需求编号只留在
+  代码注释与 CHANGELOG。
+
+- **18 个 `import_*` 聊天导入工具收敛为单一 `import_chat` 分发器（注册工具
+  32 → 15）** — 会话工具面从每来源一个工具（`import_claude` / `import_codex` /
+  `import_chatgpt` / `import_cursor` / `import_gemini` / `import_reasonix` /
+  `import_opencode` / `import_mimocode` / `import_zcode` / `import_grokbuild` /
+  `import_openclaw` / `import_hermes` / `import_pi` / `import_kimi` /
+  `import_qoder` / `import_workbuddy` / `import_dsh` / `import_local_jsonl`）
+  改为一个 `import_chat({ format, path })`，`format` 为 18 值 enum 选择来源。
+  参数/输出 schema/幂等/`session/imported` 标记/归组语义逐源不变；`IMPORT_SPECS`
+  登记由分发器工厂维护，导入面板与 `/import` 命令零影响。每请求工具 schema 中
+  import 部分从 34,059 字符降到 3,996 字符（省 ≈88%），全部工具每请求合计
+  从 44,835 降到 14,796 字符（省 ≈67%，约 20,026 token/请求）——
+  低使用率工具不再逐一占用模型上下文。行为差异：
+  `import_local_jsonl` 的 `format` 参数改名 `parseFormat`（避免与分发器 `format`
+  撞名）；18 份长工具描述合并为 format enum 描述（解析细节不再进模型，属有意的
+  token 权衡）。
+
+### Fixed
+
+- **sidebar.footer.action 按钮在 `flex-direction: column` 容器下撑满 footer 高度
+  （issue #25）** — 与 @ychris12138/dsh-usage-stats 0.2.10（把 footer 容器强制改
+  为纵排）同装时，行内分支的 `flex: 0 0 100%` 沿主轴（高度）解析，按钮撑满整个
+  footer、与同槽用量/设置按钮重叠。现改 `flex: 0 0 auto` + `width: 100%`：row /
+  column / wrap 三种容器下都只占全宽、高度随内容。
+
+- **sidebar.footer.action 按钮 rail（折叠侧边栏）态对齐同列图标按钮（issue #25）** —
+  rail 态与设置/用量等图标按钮同列：固定 36×36、justify-content 居中、圆角 50%
+  圆形、单图标无内边距；照旧使用侧边栏同一 CSS 变量，悬停/明暗主题表现不变。
+
+- **`/doctor` 等命令的 `input.hint` 补全，修复插件加载失败自动回滚（PR #24）** —
+  `/doctor`、`/mcp-status`、`/settings-suggest`、`/import-reset` 的 `input.hint`
+  为空字符串，被宿主 `dsh-commands` 的 `normalizeDefinition` 硬抛
+  「input hint must not be empty」；该错误发生在插件 apply 阶段，被插件加载器
+  判为 entry 加载失败 → DSH 启动校验失败 → 自动回滚，从 npm / GitHub main
+  安装的版本无法生效。四处 hint 补全为「无需参数」，并新增回归测试断言所有
+  带 input 的命令 hint 非空。
+
+- **WorkBuddy 中途孤儿 function_call_result 误挂 lastStep（PR #23 审查发现）** —
+  孤儿结果（无匹配 `function_call`：转录从中途开始 / 调用被过滤，但存在当前步）
+  此前经 `|| lastStep` 误挂到最近一步，产出**无对应 `tool/call` 的孤儿
+  `tool/result` 事件**——恢复会话时模型 API 拒绝（与 claude 转换器同款纪律：
+  孤儿结果一律丢弃，绝不挂 lastStep）。现只按 `callId` 配对，孤儿结果丢弃并计入
+  `droppedOrphanResults`。
+
+- **Claude Code 数组格式 user 消息导入 0 轮（issue #21）** — 新版 Claude Code 对直接
+  提问也写数组格式 `content`（`content:[{type:'text',...}]`），此前这类消息落入
+  tool_result 分支被静默丢弃：全数组提问的转录导入成 0 轮空会话、混合转录（字符串 +
+  数组提问）丢提问且无任何提示。现把无 `tool_result` 块的数组 user 消息视为直连提问
+  开新轮（text 块按换行拼接为 prompt）；含 `tool_result` 块的数组继续走工具结果分支。
+  无法解析的 user content 计入 `droppedUserPrompts`，0 轮 + 有丢弃时显式标注
+  `skipReason`「0 轮导入…内容丢失」，绝不静默成功。
+
+- **retract_import 后宿主残留幽灵会话，同源重导被 already exists 拒绝（issue #22）** —
+  DSH 宿主内存会话索引无 delete/forget 面：撤回并手动删除工件后，会话 id 仍占内存
+  索引（GUI 列表可见、重启才消失），同源重导抛 `session "<id>" already exists in
+  this backend`（或幂等跳过），只能换新 id 或重启服务器。现两层自愈：决策层识别
+  「list 仍暴露但日志不可读」的幽灵条目，自动另铸后缀新 id（`import-<id>-1`）完整
+  重导并报告 `staleGhost: { previous, current }`；落盘层 create 撞 already exists
+  时同样另铸新 id 重试一次，registry 记录 / 批量结果同步到新 id。`retract_import`
+  的 `manualDelete` 引导补充「彻底消失需重启 dsh」说明。
+
+## [0.7.0] - 2026-08-23
 
 ### Added
 
@@ -30,27 +345,44 @@ Release dates are the npm publish timestamps in Asia/Shanghai (UTC+8).
   `subagentSkipped` 保持可见。Claude `agent-*`、Qoder/Kimi `subagents/` 等既有
   过滤不变。
 
-## [0.6.2] - 2026-08-19
+- **导入会话总是注入环境变更声明** — 此前「迁移到 DSH，工具 / 权限 / 执行指令以
+  当前会话为准」的免责声明只在开启「导入系统提示词」开关时随源提示词一并注入；
+  默认关时继续会话会缺少该声明，模型可能沿用源环境的旧工具名 / 旧命令（如 Claude
+  的 `Bash` / `Read`、Codex 的 `shell`），导致工具调用失败。现把环境变更声明与
+  源系统提示词解耦：**每个导入会话**都在首个回合前钉一条「上下文注入」折叠行声明
+  环境已迁移；`importSystemPrompt` 开关只决定是否附上源 `system` / `developer`
+  提示词正文。声明不计入「消息数」（`messages` 只统计真实 source 消息），导出
+  `export_claude` 时按 `source.kind='plugin'` 跳过不串写回 Claude。
 
 ### Fixed
 
-- **Session-start scan no longer recurses into `node_modules` (#16)** — the
-  migration hint triggered on `agent/session-start` called `discoverSessions`
-  with `path: cwd`, whose recursive walkers (`walkFiles` /
-  `walkGrokbuildSessions` / `walkKimiSessions`) had no directory blacklist,
-  no depth limit, and no concurrent dedup. Under pnpm's symlinked
-  `node_modules` the walk descended into the `.pnpm` store via hundreds of
-  alias paths and never terminated — every session pinned ~1 CPU core
-  permanently (2 sessions ≈ 270%, 4 cores saturated). All three walkers now
-  skip `node_modules` / `.git` / `.venv` / `dist` / `build` / `.next` /
-  `.turbo` / `.cache` / `target` / `out` / `.idea` / `.vscode` /
-  `__pycache__` etc. (`WALK_SKIP_DIRS`) and cap depth at 12
-  (`WALK_MAX_DEPTH`, legitimate chat roots are ≤5 levels). `discoverSessions`
-  additionally dedups concurrent same-key scans via an in-flight Promise map
-  (`inflightScans`) so multiple sessions starting at once share one scan
-  instead of stacking. The existing 30s TTL cache and persistent
-  mtime/size bookmarks are unchanged; `DSH_IMPORT_SESSION_HINT=0` remains
-  the emergency off switch.
+- **设置页「导入系统提示词」开关打不开** — Browser 侧 `settings.plugins.tab` 槽由
+  `ui-settings-plugins` 声明，而它依赖的 `settingsScope`（又依赖 `connection` /
+  `remote`）与 `locale` 都是晚挂载服务；本插件客户端此前只 `inject: ["slots"]`，
+  `apply` 期 `ctx.get('settingsScope')` 拿到 `undefined`，整段 TAB 注册被跳过——
+  设置页里根本没有「会话导入」TAB，开关自然打不开。现把 `locale` 声明进客户端
+  `inject`（面板 i18n 同步修复），并在 `slots.inject("settings.plugins.tab")` 回调内
+  resolve `settingsScope`（槽声明时该服务已就绪），TAB 正常注册、开关可读写。
+
+- **`doctor` 等四个工具补 `output.render`（issue #20）** — 宿主 `@deepseek-ai/dsh-tools`
+  更新后 `defineTool()` 恒暴露 `output.render(args, value)`（内部调用捕获的
+  `userRender`），未提供 `render` 的工具渲染输出即抛 `userRender is not a function`。
+  `doctor` / `import_agents` / `import_mcp` / `import_settings` 四个直接 `defineTool`
+  注册、此前漏写 `render` 的工具现补上人类可读文本渲染（`doctor` 报 checks/issues、
+  其余报预览/落盘/计划摘要），工具恢复可用。
+
+- **`verify_session` 结构校验对齐原生 DSH 会话语义（issue #20 附注）** — 校验此前
+  按「导入会话」语义过严，对原生 DSH 会话产生三类误报：① 事件类型白名单只列 10 种
+  durable 事件，把 `permission/preset`、`sandbox/mode`、`assistant/chunk`、
+  `request/header`、`approval/policy`、`agent/inbox/spliced` 等运行时/状态事件误报
+  `unknown-type`；② `sourceEventSeqs` 一律要求指向 `tool/call`，但原生会话
+  `assistant/message` 可引用 `assistant/chunk`（消息重建）；③ `surfaceOp` 只认
+  `'append'`，但 compaction 的 `{ op: 'replace' }` 是合法形态。现改为：白名单对齐
+  宿主 `KNOWN_SESSION_EVENT_TYPES`（0.1.1-rc.2，48 种）+ 自产 `session/imported` 标记；
+  `sourceEventSeqs` 指向校验只作用于 `tool/result`；`surfaceOp` 仅判缺失。导入保留
+  的 durable 类型仍由 `convert/dsh.mjs` 的 `DURABLE` 集合独立控制。
+
+## [0.6.2] - 2026-08-19
 
 ### Added
 
@@ -82,6 +414,26 @@ Release dates are the npm publish timestamps in Asia/Shanghai (UTC+8).
   namespace is registered host-side via `ctx.settings`
   (`@deepseek-ai/schemastery` peer) and read during import, degrading to off
   when the settings service is absent.
+
+### Fixed
+
+- **Session-start scan no longer recurses into `node_modules` (#16)** — the
+  migration hint triggered on `agent/session-start` called `discoverSessions`
+  with `path: cwd`, whose recursive walkers (`walkFiles` /
+  `walkGrokbuildSessions` / `walkKimiSessions`) had no directory blacklist,
+  no depth limit, and no concurrent dedup. Under pnpm's symlinked
+  `node_modules` the walk descended into the `.pnpm` store via hundreds of
+  alias paths and never terminated — every session pinned ~1 CPU core
+  permanently (2 sessions ≈ 270%, 4 cores saturated). All three walkers now
+  skip `node_modules` / `.git` / `.venv` / `dist` / `build` / `.next` /
+  `.turbo` / `.cache` / `target` / `out` / `.idea` / `.vscode` /
+  `__pycache__` etc. (`WALK_SKIP_DIRS`) and cap depth at 12
+  (`WALK_MAX_DEPTH`, legitimate chat roots are ≤5 levels). `discoverSessions`
+  additionally dedups concurrent same-key scans via an in-flight Promise map
+  (`inflightScans`) so multiple sessions starting at once share one scan
+  instead of stacking. The existing 30s TTL cache and persistent
+  mtime/size bookmarks are unchanged; `DSH_IMPORT_SESSION_HINT=0` remains
+  the emergency off switch.
 
 ## [0.6.1] - 2026-08-18
 
@@ -158,6 +510,16 @@ Release dates are the npm publish timestamps in Asia/Shanghai (UTC+8).
   (only the main `<sessionId>.jsonl` becomes a session). `scan_discover` picks
   up `~/.qoder/projects` by default, and `import_local_jsonl` auto-detects
   Qoder files by their path layout.
+- **Kimi Code standalone (`~/.kimi-code`) import support** — `import_kimi`
+  previously only understood the old Kimi CLI layout
+  (`~/.kimi/sessions/<md5>/<sessionId>/wire.jsonl`) and old wire format
+  (`TurnBegin` / `TextPart` / …). It now also discovers and imports the new
+  Kimi Code layout
+  (`~/.kimi-code/sessions/<workspaceId>/<sessionId>/agents/main/wire.jsonl`)
+  and its wire events (`turn.prompt` / `context.append_loop_event` / …), with
+  `state.json` providing `cwd` and title metadata. `scan_discover` includes
+  `~/.kimi-code/sessions` by default and both layouts remain under the
+  `kimi` format / `import_kimi` tool.
 
 ### Security
 
@@ -170,19 +532,6 @@ Release dates are the npm publish timestamps in Asia/Shanghai (UTC+8).
   `gitDirty` field is downgraded to always `null` (it cannot be computed
   reliably without invoking git); `gitBranch` keeps working for standard and
   worktree checkouts.
-
-### Fixed
-
-- **Kimi Code standalone (`~/.kimi-code`) import support** — `import_kimi`
-  previously only understood the old Kimi CLI layout
-  (`~/.kimi/sessions/<md5>/<sessionId>/wire.jsonl`) and old wire format
-  (`TurnBegin` / `TextPart` / …). It now also discovers and imports the new
-  Kimi Code layout
-  (`~/.kimi-code/sessions/<workspaceId>/<sessionId>/agents/main/wire.jsonl`)
-  and its wire events (`turn.prompt` / `context.append_loop_event` / …), with
-  `state.json` providing `cwd` and title metadata. `scan_discover` includes
-  `~/.kimi-code/sessions` by default and both layouts remain under the
-  `kimi` format / `import_kimi` tool.
 
 ## [0.5.1] - 2026-08-16
 
@@ -829,18 +1178,6 @@ pending publish.
   with `budgetChanged` (same semantics as `argsChanged`; `force: true`
   rebuilds).
 
-### Fixed
-
-- **`trimTurns` L2 anchor shrink silently dropped turns** (REQ-49) — when
-  the whole turn list was within the 3-anchor minimum and the budget was
-  so small that even the anchor plus summary allowance exceeded it, turns
-  shrunk off the anchor tail vanished without being counted, so `trimmed`
-  could report `null` despite real loss (violating "fail loudly"). Turns
-  dropped by anchor shrink are now counted into `trimmed`
-  (`droppedTurns` / `droppedMessages` / `droppedToolCalls` /
-  `droppedToolResults`) so the report reflects the real loss; at least
-  one resumable turn is still guaranteed.
-
 ### Changed
 
 - Idempotency contract updated (bilingual README): "already imported → skip"
@@ -857,6 +1194,17 @@ pending publish.
   moved to the local, never-published `dev/REQUIREMENTS.md`; the tagline and
   badge area reworked for the 11-source line-up.
 
+### Fixed
+
+- **`trimTurns` L2 anchor shrink silently dropped turns** (REQ-49) — when
+  the whole turn list was within the 3-anchor minimum and the budget was
+  so small that even the anchor plus summary allowance exceeded it, turns
+  shrunk off the anchor tail vanished without being counted, so `trimmed`
+  could report `null` despite real loss (violating "fail loudly"). Turns
+  dropped by anchor shrink are now counted into `trimmed`
+  (`droppedTurns` / `droppedMessages` / `droppedToolCalls` /
+  `droppedToolResults`) so the report reflects the real loss; at least
+  one resumable turn is still guaranteed.
 
 ## [0.2.0] - 2026-08-14
 
@@ -887,6 +1235,17 @@ package metadata) and P0 fixes that keep imported sessions resumable. Tagged
 - **Headless real-load smoke job in CI** — boots the plugin with a mock LLM to
   verify it activates outside the live harness ([0e8bdd7](https://github.com/Nwflower/dsh-chat-import/commit/0e8bdd7)).
 
+### Changed
+
+- **README rewritten (bilingual)** around quick start, features and a 7-source
+  overview table; test count corrected 68 → 79 ([585cece](https://github.com/Nwflower/dsh-chat-import/commit/585cece)).
+- Reasonix import documented in the bilingual READMEs ([0aded42](https://github.com/Nwflower/dsh-chat-import/commit/0aded42)).
+- Multi-session protocol documents the pending-merge area ([c691324](https://github.com/Nwflower/dsh-chat-import/commit/c691324)).
+- Peer dependency policy relaxed to `^0.1.0-rc.6` so the plugin installs
+  alongside newer DSH releases ([117e7a1](https://github.com/Nwflower/dsh-chat-import/commit/117e7a1)).
+- `package.json` metadata completed and `engines` pinned to `>=22.13`, with the
+  lockfile's engines entry synced to match ([7162957](https://github.com/Nwflower/dsh-chat-import/commit/7162957), [41ad12a](https://github.com/Nwflower/dsh-chat-import/commit/41ad12a)).
+
 ### Fixed
 
 - **Imported sessions stay resumable when a `tool/call` has no matching
@@ -908,17 +1267,6 @@ package metadata) and P0 fixes that keep imported sessions resumable. Tagged
   the transcript nor the meta file carries one ([bf8b05e](https://github.com/Nwflower/dsh-chat-import/commit/bf8b05e)).
 - **opencode directory import joins paths portably** instead of hard-coding a
   separator ([72238ba](https://github.com/Nwflower/dsh-chat-import/commit/72238ba)).
-
-### Changed
-
-- **README rewritten (bilingual)** around quick start, features and a 7-source
-  overview table; test count corrected 68 → 79 ([585cece](https://github.com/Nwflower/dsh-chat-import/commit/585cece)).
-- Reasonix import documented in the bilingual READMEs ([0aded42](https://github.com/Nwflower/dsh-chat-import/commit/0aded42)).
-- Multi-session protocol documents the pending-merge area ([c691324](https://github.com/Nwflower/dsh-chat-import/commit/c691324)).
-- Peer dependency policy relaxed to `^0.1.0-rc.6` so the plugin installs
-  alongside newer DSH releases ([117e7a1](https://github.com/Nwflower/dsh-chat-import/commit/117e7a1)).
-- `package.json` metadata completed and `engines` pinned to `>=22.13`, with the
-  lockfile's engines entry synced to match ([7162957](https://github.com/Nwflower/dsh-chat-import/commit/7162957), [41ad12a](https://github.com/Nwflower/dsh-chat-import/commit/41ad12a)).
 
 ## [0.1.1] - 2026-08-14
 
@@ -943,18 +1291,18 @@ Tagged `v0.1.1` (`586a5f9`).
 - **`npm pack --dry-run` as a publish-surface regression guard** in CI
   ([7422e48](https://github.com/Nwflower/dsh-chat-import/commit/7422e48)).
 
-### Fixed
-
-- **Batch import reports per-file error detail** — the completion summary now
-  lists up to five failed/skipped paths with their reasons instead of aggregate
-  counts only (the reason for this release; [fb657a2](https://github.com/Nwflower/dsh-chat-import/commit/fb657a2)).
-
 ### Changed
 
 - README first-screen: badge row, tagline and a compatibility matrix for the
   then-four sources ([572222c](https://github.com/Nwflower/dsh-chat-import/commit/572222c)).
 - CI npm cache dropped (no lockfile yet at the time) ([ad9ce48](https://github.com/Nwflower/dsh-chat-import/commit/ad9ce48));
   `.gitignore` extended for editor/system noise ([243fbb2](https://github.com/Nwflower/dsh-chat-import/commit/243fbb2)).
+
+### Fixed
+
+- **Batch import reports per-file error detail** — the completion summary now
+  lists up to five failed/skipped paths with their reasons instead of aggregate
+  counts only (the reason for this release; [fb657a2](https://github.com/Nwflower/dsh-chat-import/commit/fb657a2)).
 
 ## [0.1.0] - 2026-08-13
 

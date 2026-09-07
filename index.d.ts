@@ -1,11 +1,11 @@
 // index.d.ts — dsh-chat-import 类型面（手写维护，随工具 schema 变更同步）
 //
 // 本包是零构建纯 ESM 插件：index.mjs 只导出 Cordis 插件入口（apply/inject/name）
-// 与少量 host 面辅助函数；22 个工具由 apply 动态注册，不在此模块导出。
+// 与少量 host 面辅助函数；13 个工具由 apply 动态注册，不在此模块导出。
 // 因此本文件把「工具调用面」声明为一个类型化接口（ToolSurface），供 TS 调用方
 // 参考参数/返回结构，而不是伪装成真实的模块导出。
 //
-// 结构对齐 lib/tools.mjs 注册的 schema 与 lib/toolkit.mjs 的 makeImportTool
+// 结构对齐 lib/tools.mjs 注册的 schema 与 lib/toolkit.mjs 的 makeImportChatTool
 // 输出 oneOf（单文件/批量 × 预览/实导入）。修改工具 schema 时须同步此处。
 
 // ---------- Cordis 插件入口（index.mjs 的真实导出） ----------
@@ -25,35 +25,24 @@ export declare function readOpencodeDb(...args: unknown[]): Promise<unknown>
 export declare function readZcodeDb(...args: unknown[]): Promise<unknown>
 export declare function exportClaudeSession(
   ctx: HostContext,
-  args: ExportClaudeParams,
+  args: ExportChatParams & { cwd?: string },
   options?: { registryDir?: string },
-): Promise<ExportClaudeResult>
+): Promise<ExportChatResult>
 
-// ---------- 工具调用面（ToolSurface：apply 注册的 21 个工具） ----------
+// ---------- 工具调用面（ToolSurface：apply 注册的 13 个工具） ----------
+// import_chat 是 19 个聊天导入源（18 个面板来源 + local-jsonl）的统一分发入口：
+// format 必填（源枚举），专属参数（compacted / branch / sessionIds / fullHistory /
+// lineage / lineageMode / parseFormat）只对相应 format 生效。export_chat 是 DSH → Claude/Codex/Kimi
+// 三个出边的统一分发入口：format 必填（claude/codex/kimi），cwd 仅 claude 有效、
+// path 仅 codex/kimi 有效。
 
 export interface ToolSurface {
-  import_claude(options: ImportOptions): Promise<ImportResult>
-  import_codex(options: ImportOptions): Promise<ImportResult>
-  import_codebuddy(options: ImportOptions): Promise<ImportResult>
-  import_chatgpt(options: ImportOptions & { branch?: 'main' | 'all' }): Promise<ImportResult>
-  import_cursor(options: ImportOptions): Promise<ImportResult>
-  import_gemini(options: ImportOptions): Promise<ImportResult>
-  import_reasonix(options: ImportOptions): Promise<ImportResult>
-  import_opencode(options: ImportOptions & OpencodeExtraParams): Promise<ImportResult>
-  import_mimocode(options: ImportOptions & OpencodeExtraParams): Promise<ImportResult>
-  import_zcode(options: ImportOptions & ZcodeExtraParams): Promise<ImportResult>
-  import_grokbuild(options: ImportOptions): Promise<ImportResult>
-  import_openclaw(options: ImportOptions): Promise<ImportResult>
-  import_pi(options: ImportOptions & { fullHistory?: boolean }): Promise<ImportResult>
-  import_hermes(options: ImportOptions): Promise<ImportResult>
-  import_kimi(options: ImportOptions): Promise<ImportResult>
-  import_qoder(options: ImportOptions): Promise<ImportResult>
-  import_dsh(options: ImportOptions): Promise<ImportResult>
-  import_local_jsonl(options: ImportOptions & { format?: LocalJsonlFormat }): Promise<ImportResult>
+  import_chat(options: ImportChatOptions): Promise<ImportResult>
   import_agents(options?: AgentsImportOptions): Promise<AgentsImportResult>
-  export_claude(options: ExportClaudeParams): Promise<ExportClaudeResult>
-  export_codex(options: ExportTargetParams): Promise<ExportTargetResult>
-  export_kimi(options: ExportTargetParams): Promise<ExportTargetResult>
+  import_mcp(options?: ImportMcpParams): Promise<ImportMcpResult>
+  import_settings(options?: ImportSettingsParams): Promise<ImportSettingsResult>
+  doctor(): Promise<DoctorResult>
+  export_chat(options: ExportChatParams): Promise<ExportChatResult>
   export_bundle(options: ExportBundleParams): Promise<ExportBundleResult>
   restore_bundle(options: RestoreBundleParams): Promise<RestoreBundleResult>
   verify_session(options: { sessionId: string }): Promise<VerifySessionResult>
@@ -76,26 +65,40 @@ export interface ImportOptions {
   preview?: boolean
   /** preview 的兼容别名（语义相同）。 */
   dryRun?: boolean
-  /** 目标 DSH 会话 id（仅单文件导入时生效，默认 import-<源sessionId>；目录模式忽略）。 */
+  /** 目标 DSH 会话 id（仅单文件导入时生效，默认 import-<源sessionId>；目录模式 / SQLite 库源忽略）。 */
   sessionId?: string
-  /** 目录模式是否递归子目录（默认 true；opencode/zcode 无此参数）。 */
+  /** 目录模式是否递归子目录（默认 true；SQLite 库源忽略）。 */
   recursive?: boolean
-}
-
-export interface OpencodeExtraParams {
-  /** 只导入指定源会话 id（缺省导入全部）。 */
-  sessionIds?: string[]
-  /** true 时导入全量历史（忽略 opencode 对话压缩）；默认 false。 */
-  fullHistory?: boolean
-}
-
-export interface ZcodeExtraParams {
-  /** 只导入指定源会话 id（缺省导入全部）。 */
-  sessionIds?: string[]
 }
 
 export type LocalJsonlFormat =
   | 'dsh' | 'claude' | 'codex' | 'codebuddy' | 'cursor' | 'reasonix' | 'pi' | 'openclaw' | 'hermes' | 'qoder'
+
+/** import_chat 的源格式枚举（值 = 来源短名，与面板来源 / discovery FORMATS 一致）。 */
+export type ChatFormat =
+  | 'claude' | 'codex' | 'chatgpt' | 'cursor' | 'gemini' | 'reasonix' | 'opencode'
+  | 'mimocode' | 'kilocode' | 'zcode' | 'grokbuild' | 'openclaw' | 'hermes' | 'pi' | 'kimi'
+  | 'qoder' | 'workbuddy' | 'qwen' | 'dsh' | 'local-jsonl'
+
+/** import_chat 参数：公共导入参数（ImportOptions）+ 源格式 + 源专属参数。 */
+export interface ImportChatOptions extends ImportOptions {
+  /** 源格式（必填），决定 path 形态与解析器。 */
+  format: ChatFormat
+  /** 仅 claude：true 时只导最后一次压缩摘要 + 尾部（compacted 摘要导入）；默认 false 全量。 */
+  compacted?: boolean
+  /** 仅 chatgpt：'main'（默认）只重建主线程；'all' 枚举全部分支会话。 */
+  branch?: 'main' | 'all'
+  /** 仅 opencode / mimocode / zcode：只导入指定源会话 id（缺省导入全部）。 */
+  sessionIds?: string[]
+  /** 仅 opencode / mimocode / pi：true 时导入全量历史（忽略对话压缩）；默认 false 尊重压缩。 */
+  fullHistory?: boolean
+  /** 仅 hermes：'tail' 只导 lineage 链尾（叶子会话）。 */
+  lineage?: 'tail'
+  /** 仅 reasonix 目录：canonical（默认）只折叠有严格语义前缀及明确 parent_id 谱系证明的恢复祖先；physical 逐文件导入。 */
+  lineageMode?: 'canonical' | 'physical'
+  /** 仅 local-jsonl：强制按指定格式解析；缺省自动识别。 */
+  parseFormat?: LocalJsonlFormat
+}
 
 export type ImportStatus = 'imported' | 'already-imported' | 'appended' | 'skipped' | 'failed'
 
@@ -157,6 +160,9 @@ export interface SingleImportResult {
   droppedBoundaryResults?: number
   trimmed?: TrimReport | null
   forceImported?: { previous: string; current: string }
+  /** issue #22：宿主内存残留幽灵会话（retract 后工件已删）时重导自动另铸后缀新 id，
+   * previous = 幽灵原 id、current = 新落盘 id。 */
+  staleGhost?: { previous: string; current: string }
   validation?: ValidationReport
 }
 
@@ -179,6 +185,8 @@ export interface BatchItemResult {
   backfilled?: boolean
   trimmed?: TrimReport | null
   forceImported?: { previous: string; current: string }
+  /** issue #22：同 SingleImportResult.staleGhost（批量条目）。 */
+  staleGhost?: { previous: string; current: string }
   validation?: ValidationReport
 }
 
@@ -257,51 +265,64 @@ export interface AgentsImportResult {
   }>
 }
 
-// ---------- export_codex / export_kimi（REQ-23 矩阵化互转） ----------
+// ---------- doctor（只读健康检查） ----------
 
-export interface ExportTargetParams {
-  /** 要导出的 DSH 会话 id（必填）。 */
-  sessionId: string
-  /** 输出文件路径（缺省 <outputDir>/<sessionId>.rollout.jsonl 或 .wire.jsonl）。 */
-  path?: string
-  /** 输出目录（默认 ~/.dsh/exports）。 */
-  outputDir?: string
-  /** true 时不写盘，只序列化并返回目标路径与统计。 */
-  dryRun?: boolean
-}
-
-export interface ExportTargetResult {
-  mode: 'single'
-  sessionId: string
-  filePath: string
-  recordCount: number
-  toolCalls: number
-  toolResults: number
-  dryRun: boolean
-  degradations?: Array<{ id: string; kind: string; strategy: 'lossless' | 'text-fallback' | 'skip-placeholder'; count: number }>
-}
-
-// ---------- verify_session（REQ-23 只读结构校验 + repair 提示） ----------
-
-export interface VerifySessionResult {
-  mode: 'single'
-  sessionId: string
+export interface DoctorResult {
   ok: boolean
-  eventCount: number
-  turns: number
-  title?: string
-  problems: Array<{ kind: string; seq: number | null; message: string }>
-  repairHints: Array<{ kind: string; hint: string }>
+  checks: Array<{ name: string; ok: boolean; detail?: string }>
+  issues: string[]
+  totals: { records: number; sessions: number; missingSessions: number; skills: number }
 }
 
-// ---------- export_claude / sync_to_claude ----------
+// ---------- import_mcp（Claude/Codex MCP → DSH MCP client 镜像计划） ----------
 
-export interface ExportClaudeParams {
+export interface ImportMcpParams {
+  /** Claude MCP 配置文件路径（默认 ~/.claude.json；也兼容项目 .mcp.json 内容）。 */
+  claudeMcpPath?: string
+  /** Codex config.toml 路径（默认 ~/.codex/config.toml）。 */
+  codexConfigPath?: string
+  /** true 时写盘生成片段（默认 false = dry-run）。 */
+  apply?: boolean
+  /** apply 时输出路径（默认 $DSH_HOME/dsh-chat-import/mcp-mirror.cordis.yml）。 */
+  outPath?: string
+}
+
+export interface ImportMcpResult {
+  total: number
+  servers: Array<{ source: string; name: string; command: string; args: string[]; env: Record<string, string> }>
+  planText: string
+  writtenTo?: string
+}
+
+// ---------- import_settings（Claude/Codex 配置迁移建议，只读） ----------
+
+export interface ImportSettingsParams {
+  /** Claude settings.json 路径（默认 ~/.claude/settings.json）。 */
+  claudeSettingsPath?: string
+  /** Codex config.toml 路径（默认 ~/.codex/config.toml）。 */
+  codexConfigPath?: string
+}
+
+export interface ImportSettingsResult {
+  total: number
+  suggestions: Array<{ key: string; source: string; value: string; suggestion: string; unmappable: boolean }>
+  sources: string[]
+}
+
+// ---------- export_chat（DSH → Claude/Codex/Kimi 三合一，矩阵化互转） ----------
+
+export type ExportFormat = 'claude' | 'codex' | 'kimi'
+
+export interface ExportChatParams {
+  /** 目标格式（必填）：claude=Claude Code JSONL（可 --resume 续聊）；codex=Codex rollout JSONL；kimi=Kimi CLI wire.jsonl。 */
+  format: ExportFormat
   /** 要导出的 DSH 会话 id（必填）。 */
   sessionId: string
-  /** 覆盖导出记录的 cwd（默认取会话 header.cwd；两者皆无则报错）。 */
+  /** 覆盖导出记录的 cwd（仅 claude；默认取会话 header.cwd；两者皆无则报错）。 */
   cwd?: string
-  /** Claude Code projects 根目录（默认 ~/.claude/projects），文件写到 <outputDir>/<slug>/<uuid>.jsonl。 */
+  /** 输出文件路径（仅 codex/kimi；缺省 <outputDir>/<sessionId>.rollout.jsonl 或 .wire.jsonl）。 */
+  path?: string
+  /** 输出目录（claude 默认 ~/.claude/projects，文件写到 <outputDir>/<slug>/<uuid>.jsonl；codex/kimi 默认 ~/.dsh/exports）。 */
   outputDir?: string
   /** true 时不写盘，只序列化并返回目标路径与统计。 */
   dryRun?: boolean
@@ -320,22 +341,40 @@ export interface ExportMapping {
   skippedInjections: number
 }
 
-export interface ExportClaudeResult {
+export interface ExportChatResult {
   mode: 'single'
   sessionId: string
-  sourceSessionId: string
   filePath: string
-  slug: string
-  cwd: string
   recordCount: number
-  title?: string
   dryRun: boolean
-  mapping: ExportMapping
+  /** claude 分支：原会话 id / slug / cwd / 标题（codex/kimi 无）。 */
+  sourceSessionId?: string
+  slug?: string
+  cwd?: string
+  title?: string
+  /** claude 分支：写回副本映射（codex/kimi 无）。 */
+  mapping?: ExportMapping
+  /** codex/kimi 分支：工具调用/结果计数（claude 无顶层计数，见 mapping）。 */
+  toolCalls?: number
+  toolResults?: number
   /** REQ-21 降级清单（有损项逐条报告；仅非空时出现）。 */
   degradations?: Array<{ id: string; kind: string; strategy: 'lossless' | 'text-fallback' | 'skip-placeholder'; count: number }>
 }
 
-// ---------- export_bundle / restore_bundle（REQ-56/62 interchange bundle） ----------
+// ---------- verify_session（REQ-23 只读结构校验 + repair 提示） ----------
+
+export interface VerifySessionResult {
+  mode: 'single'
+  sessionId: string
+  ok: boolean
+  eventCount: number
+  turns: number
+  title?: string
+  problems: Array<{ kind: string; seq: number | null; message: string }>
+  repairHints: Array<{ kind: string; hint: string }>
+}
+
+// ---------- sync_to_claude（反向同步增量写回） ----------
 
 export interface ExportBundleParams {
   /** 要导出的 DSH 会话 id（必填）。 */
@@ -418,7 +457,7 @@ export interface RestoreBundleResult {
 export interface SyncToClaudeParams {
   /** 要写回的 DSH 会话 id（必须是由本插件导入的会话，带 session/imported 标记）。 */
   sessionId: string
-  /** 写回目标 'source'（默认，导入源文件）| 'copy'（export_claude 导出的副本）。 */
+  /** 写回目标 'source'（默认，导入源文件）| 'copy'（export_chat format=claude 导出的副本）。 */
   target?: 'source' | 'copy'
   /** true 时跳过三闸守卫并以当前文件重锚定，可能覆盖外部修改。 */
   force?: boolean
@@ -495,9 +534,9 @@ export interface RetractResult {
 // ---------- scan_discover ----------
 
 export type ScanFormat =
-  | 'claude' | 'codex' | 'cursor' | 'gemini' | 'reasonix' | 'opencode'
-  | 'zcode' | 'grokbuild' | 'openclaw' | 'pi' | 'hermes' | 'kimi'
-  | 'qoder' | 'chatgpt' | 'dsh'
+  | 'claude' | 'codex' | 'cursor' | 'gemini' | 'reasonix' | 'opencode' | 'mimocode'
+  | 'kilocode' | 'zcode' | 'grokbuild' | 'openclaw' | 'pi' | 'hermes' | 'kimi'
+  | 'qoder' | 'chatgpt' | 'workbuddy' | 'qwen' | 'dsh'
 
 export type ImportStatusLabel = 'imported' | 'partial' | 'not-imported' | 'archived'
 

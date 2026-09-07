@@ -99,21 +99,29 @@ function makeCtx() {
   return { ctx, persistence, attached, registered }
 }
 
-function registeredDef(ctx, toolName = 'import_mimocode') {
+function registeredDef(ctx, toolName) {
   return ctx.tools.registered(toolName)
 }
 
-// REQ-32：导入会话日志首事件为 session/imported 标记（seq 0、ignorable）。
-function assertImportedMarker(events, { tool, sourceId, sourcePath }) {
-  const ev = events[0]
-  assert.equal(ev.type, 'session/imported')
-  assert.equal(ev.seq, 0)
-  assert.equal(ev.ignorable, true)
-  assert.equal(ev.data.tool, tool)
-  assert.equal(ev.data.sourceId, sourceId)
-  assert.equal(ev.data.sourcePath, sourcePath)
-  assert.equal(typeof ev.data.importedAt, 'number')
-  assert.ok(ev.data.importedAt > 0)
+// 辅助：import_chat 分发器定义——execute 时注入 format（等价旧 import_mimocode）
+function chatDef(ctx, format = 'mimocode') {
+  const tool = registeredDef(ctx, 'import_chat')
+  return { ...tool, execute: (args) => tool.execute({ format, ...args }) }
+}
+
+// 导入归属外置 registry（issue #34）：0.8.3 起日志不再写 session/imported 标记，
+// 事件 envelope 键收敛在宿主白名单内（type/seq/time/data/surfaceOp/sourceEventSeqs）。
+function assertEnvelopeHygiene(events) {
+  assert.ok(events.every((e) => e.type !== 'session/imported'), '日志不得含 session/imported 标记')
+  const ALLOWED = new Set(['type', 'seq', 'time', 'data', 'surfaceOp', 'sourceEventSeqs'])
+  for (const e of events) {
+    for (const key of Object.keys(e)) {
+      assert.ok(ALLOWED.has(key), '事件 envelope 出现白名单外键: ' + key)
+    }
+    assert.equal(typeof e.seq, 'number')
+    assert.equal(typeof e.time, 'number')
+    assert.notEqual(e.data, undefined)
+  }
 }
 
 // ── 合成 mimocode.db fixture：session 表无 model 列（与 opencode 唯一 schema 差异） ──
@@ -217,7 +225,7 @@ test('convertMimocodeJson：provider 标签为 mimocode（复用 opencode 转换
   const [session] = readMimocodeDb(dbPath)
   const out = convertMimocodeJson(JSON.stringify(session), { sourcePath: dbPath })
   assert.equal(out.turns.length, 1)
-  assertImportedMarker(out.events, { tool: 'mimocode', sourceId: 'mim-a', sourcePath: dbPath })
+  assertEnvelopeHygiene(out.events)
 })
 
 // ── isMimocodeBackgroundSession：后台任务会话双信号判定 ──────────────────
@@ -259,7 +267,7 @@ test('import_mimocode 单库文件：批量形态、逐会话落盘、schema 校
   const dbPath = makeMimocodeDb(mimocodeTestSessions())
   const { ctx, persistence, attached } = makeCtx()
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx)
   const value = await def.execute({ path: dbPath })
 
   assert.equal(value.mode, 'batch')
@@ -277,14 +285,14 @@ test('import_mimocode 单库文件：批量形态、逐会话落盘、schema 校
   assert.equal(saved.meta.createdAt, 1786000000000)
   assert.equal(saved.events.at(-1).type, 'session/title')
   assert.ok(saved.events.every((e, i) => e.seq === i))
-  assertImportedMarker(saved.events, { tool: 'mimocode', sourceId: 'mim-a', sourcePath: dbPath })
+  assertEnvelopeHygiene(saved.events)
 })
 
 test('import_mimocode sessionIds 过滤：只导指定源会话', async () => {
   const dbPath = makeMimocodeDb(mimocodeTestSessions())
   const { ctx, persistence } = makeCtx()
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx)
   const value = await def.execute({ path: dbPath, sessionIds: ['mim-b'] })
 
   assert.equal(value.mode, 'batch')
@@ -300,7 +308,7 @@ test('import_mimocode 幂等：重复导入同一库只落盘一次', async () =
   const dbPath = makeMimocodeDb(mimocodeTestSessions())
   const { ctx, persistence } = makeCtx()
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx)
   const first = await def.execute({ path: dbPath })
   const second = await def.execute({ path: dbPath })
 
@@ -315,7 +323,7 @@ test('import_mimocode 目录模式：自动定位 mimocode.db', async () => {
   const dbPath = makeMimocodeDb(mimocodeTestSessions())
   const { ctx, persistence } = makeCtx()
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx)
   const value = await def.execute({ path: dirname(dbPath) })
 
   assert.equal(value.mode, 'batch')

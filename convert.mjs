@@ -80,6 +80,10 @@ export {
 } from './lib/convert/mimocode.mjs'
 
 export {
+  convertKilocodeJson,
+} from './lib/convert/kilocode.mjs'
+
+export {
   convertZcodeJson,
 } from './lib/convert/zcode.mjs'
 
@@ -102,6 +106,14 @@ export {
 export {
   convertQoderJsonl,
 } from './lib/convert/qoder.mjs'
+
+export {
+  convertWorkbuddyJsonl,
+} from './lib/convert/workbuddy.mjs'
+
+export {
+  convertQwenJsonl,
+} from './lib/convert/qwen.mjs'
 
 export {
   convertDshJsonl,

@@ -57,18 +57,19 @@ function assertMessageOrderLegal(events) {
   return msgs
 }
 
-// 内部标记事件契约（REQ-32）：导入会话日志首事件（seq 0）为 session/imported。
-function assertImportedMarker(events, { tool, sourceId, sourcePath }) {
-  const ev = events[0]
-  assert.equal(ev.type, 'session/imported')
-  assert.equal(ev.seq, 0)
-  assert.equal(ev.ignorable, true)
-  assert.equal(ev.data.tool, tool)
-  assert.equal(ev.data.sourceId, sourceId)
-  assert.equal(ev.data.sourcePath, sourcePath)
-  assert.equal(typeof ev.data.importedAt, 'number')
-  assert.ok(ev.data.importedAt > 0)
-  assert.equal(events[1].type, 'turn/start')
+// 导入归属外置 registry（issue #34）：0.8.3 起日志不再写 session/imported 标记，
+// 事件 envelope 键收敛在宿主白名单内（type/seq/time/data/surfaceOp/sourceEventSeqs）。
+function assertEnvelopeHygiene(events) {
+  assert.ok(events.every((e) => e.type !== 'session/imported'), '日志不得含 session/imported 标记')
+  const ALLOWED = new Set(['type', 'seq', 'time', 'data', 'surfaceOp', 'sourceEventSeqs'])
+  for (const e of events) {
+    for (const key of Object.keys(e)) {
+      assert.ok(ALLOWED.has(key), '事件 envelope 出现白名单外键: ' + key)
+    }
+    assert.equal(typeof e.seq, 'number')
+    assert.equal(typeof e.time, 'number')
+    assert.notEqual(e.data, undefined)
+  }
 }
 
 // 合成 summary.json（Grok Build 字段；JSON.stringify 会丢弃 undefined 键）
@@ -106,11 +107,11 @@ test('convertGrokbuildJson: 简单问答、元数据、显式标题、平衡回�
   // 显式标题 → 钉 session/title 事件（最后，不破坏回合平衡）
   const types = out.events.map((e) => e.type)
   assert.deepEqual(types, [
-    'session/imported', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end', 'session/title',
+    'user/message', 'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end', 'session/title',
   ])
   assert.equal(out.events.at(-1).data.title, 'Grok 会话标题')
   out.events.forEach((e, i) => assert.equal(e.seq, i))
-  assertImportedMarker(out.events, { tool: 'grokbuild', sourceId: 'grok-sess-001', sourcePath: 'D:/demo/grok/sessions/proj-abc/grok-sess-001/summary.json' })
+  assertEnvelopeHygiene(out.events)
   for (const e of out.events.filter((e) => e.type === 'user/message' || e.type === 'assistant/message')) {
     assert.equal(e.surfaceOp, 'append')
   }
@@ -151,7 +152,7 @@ test('convertGrokbuildJson: tool_result 块随 user 记录到达（Claude 风格
     { type: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_02', content: [{ type: 'text', text: 'A 内容' }] }] },
   ]))
   assert.equal(out.turns.length, 1)
-  assert.equal(out.events.filter((e) => e.type === 'user/message').length, 1) // 结果消息不占轮
+  assert.equal(out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user').length, 1) // 结果消息不占轮
   const result = out.events.find((e) => e.type === 'tool/result')
   assert.equal(result.data.message.content[0].content[0].text, 'A 内容')
   assertToolPairing(out.events)
@@ -167,7 +168,7 @@ test('convertGrokbuildJson: string content 记录（无块）与顶层 tool_use_
   ]))
   assert.equal(out.turns.length, 1)
   assert.equal(out.events.filter((e) => e.type === 'assistant/message').length, 2) // 两步
-  const user = out.events.find((e) => e.type === 'user/message').data
+  const user = out.events.find((e) => e.type === 'user/message' && e.data.source.kind === 'user').data
   assert.equal(user.content[0].text, 'hello')
   const result = out.events.find((e) => e.type === 'tool/result')
   assert.equal(result.data.message.content[0].content[0].text, 'README.md\nsrc')
@@ -179,7 +180,7 @@ test('convertGrokbuildJson: input_text/output_text 块归一到 text', () => {
     { type: 'user', content: [{ type: 'input_text', text: '第一个问题' }] },
     { type: 'assistant', content: [{ type: 'output_text', text: '第一个回答' }] },
   ]))
-  const user = out.events.find((e) => e.type === 'user/message').data
+  const user = out.events.find((e) => e.type === 'user/message' && e.data.source.kind === 'user').data
   assert.equal(user.content[0].text, '第一个问题')
   const asst = out.events.find((e) => e.type === 'assistant/message').data.message
   assert.equal(asst.content[0].text, '第一个回答')
@@ -285,7 +286,7 @@ test('convertGrokbuildJson: 多轮切分、畸形行计数', () => {
   assert.equal(out.turns.length, 2)
   const starts = out.events.filter((e) => e.type === 'turn/start')
   assert.equal(starts.length, 2)
-  const users = out.events.filter((e) => e.type === 'user/message').map((e) => e.data.content[0].text)
+  const users = out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user').map((e) => e.data.content[0].text)
   assert.deepEqual(users, ['第一个问题', '第二个问题'])
 })
 
@@ -305,7 +306,7 @@ test('convertGrokbuildJson: 后置 tool 记录挂回 call 所属 step（不落�
   assert.equal(result.data.step, 1)
   assert.deepEqual(result.sourceEventSeqs, [call.seq])
   const msgs = assertMessageOrderLegal(out.events)
-  assert.deepEqual(msgs.map((m) => m.role), ['user', 'assistant', 'tool', 'assistant'])
+  assert.deepEqual(msgs.map((m) => m.role), ['user', 'user', 'assistant', 'tool', 'assistant'])
 })
 
 test('convertGrokbuildJson: 纯文本 tool 记录（无 id）→ 唯一未覆盖调用兜底；多候选丢弃', () => {
@@ -341,7 +342,7 @@ test('convertGrokbuildJson: 无前序 user 的 assistant 记录忽略（转录�
     { type: 'assistant', content: '好的' },
   ]))
   assert.equal(out.turns.length, 1)
-  const users = out.events.filter((e) => e.type === 'user/message')
+  const users = out.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user')
   assert.equal(users.length, 1)
   assert.equal(users[0].data.content[0].text, '现在开始')
 })
@@ -357,7 +358,6 @@ test('convertGrokbuildJson: sessionId 覆盖与 budget 裁剪透传（REQ-37）'
   assert.equal(out.meta.id, 'custom-grok')
   // sourceId 显式取自 summary，不因 DSH 会话 id 覆盖/前缀解析而改变（REQ-32）
   assert.equal(out.meta.sourceId, 'grok-sess-001')
-  assert.equal(out.events[0].data.sourceId, 'grok-sess-001')
   assert.ok(out.trimmed)
   assert.ok(out.trimmed.droppedTurns > 0)
   assert.ok(out.trimmed.estimatedTokens <= 1000)

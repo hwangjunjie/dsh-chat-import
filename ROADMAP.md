@@ -13,7 +13,7 @@
 
 | 能力 | dsh-chat-import | 生态内其他 |
 | --- | --- | --- |
-| 来源数 | 14 源 + 本地 JSONL（15 工具） | 单源 ~ 4 源 |
+| 来源数 | 17 源 + 本地 JSONL（13 工具） | 单源 ~ 4 源 |
 | 全保真（tool/result + thinking + sourceEventSeqs） | ✅ | 部分 |
 | 增量续写（append 新轮次） | ✅ | 部分（复制式） |
 | 上下文预算保护 | ✅ | — |
@@ -29,7 +29,7 @@
 | 会话开始迁移提示 + 上下文桥接 | ✅ | 部分 |
 | cwd 权威映射（`.claude.json` / slug 贪心解码）+ 沙箱防护 | ✅ | 部分 |
 
-生态内同类工具：[dsh-claude-move](https://github.com/PerryLink/dsh-claude-move)（Claude 会话+资产 copy，REQ-61 跟进点）· [dsh-plugin-cc](https://github.com/cpj-dev/dsh-plugin-cc)（DSH↔Claude 控制面桥）· [dsh-movein](https://github.com/sjh9714/dsh-movein)（Claude 配置迁移，README 指向我们补会话——互补）· [dsh-plugin-session-import](https://github.com/huguangyu666/dsh-plugin-session-import) · [dsh-import-agents](https://github.com/Chang-Tong/dsh-import-agents) · [opencode-dsh-importer](https://github.com/wang-xudong/opencode-dsh-importer) · [dsh-resume-plugin](https://github.com/Demogorgon314/dsh-resume-plugin) · [dsh-session-import](https://github.com/kinyokun/dsh-session-import) · [dsh-plugin-codex-import](https://github.com/Gordonynh/dsh-plugin-codex-import)。
+生态内同类工具：[dsh-claude-move](https://github.com/PerryLink/dsh-claude-move)（Claude 会话+资产 copy，REQ-61 跟进点）· [dsh-plugin-cc](https://github.com/cpj-dev/dsh-plugin-cc)（DSH↔Claude 控制面桥）· [dsh-movein](https://github.com/sjh9714/dsh-movein)（Claude 配置迁移，README 指向我们补会话，[首次迁移指南](https://github.com/sjh9714/dsh-movein/blob/main/docs/first-migration.zh.md)已互链——互补）· [dsh-plugin-session-import](https://github.com/huguangyu666/dsh-plugin-session-import) · [dsh-import-agents](https://github.com/Chang-Tong/dsh-import-agents) · [opencode-dsh-importer](https://github.com/wang-xudong/opencode-dsh-importer) · [dsh-resume-plugin](https://github.com/Demogorgon314/dsh-resume-plugin) · [dsh-session-import](https://github.com/kinyokun/dsh-session-import) · [dsh-plugin-codex-import](https://github.com/Gordonynh/dsh-plugin-codex-import)。
 
 ## 需求总览
 
@@ -43,7 +43,7 @@
 | REQ-06 | P1 | CI 检查双语 README 同步 | ✅ |
 | REQ-07 | P1 | peer 版本策略与兼容矩阵 | ✅ |
 | REQ-08 | P2 | `index.mjs` 按职责拆分 | ✅ |
-| REQ-09 | P2 | `makeImportTool` 参数收敛 | ✅ c56a4bf |
+| REQ-09 | P2 | `makeImportChatTool` 参数收敛（18 源 → 单分发器） | ✅ c56a4bf + 2c77b26 |
 | REQ-10 | P2 | 引入 eslint + CI 检查 | ✅ |
 | REQ-11 | P2 | 修正 dev 文档过时信息 | ✅ |
 | REQ-12 | P3 | package.json 元数据补齐 + engines 精确化 | ✅ |
@@ -65,7 +65,7 @@
 | REQ-28 | P2 | memory / skills / CLAUDE.md 上下文桥接（默认关闭） | ✅ |
 | REQ-29 | P2 | /import-all 批量命令（Web 面板 REQ-41、/import REQ-42 已落地） | ✅ c53bc4c |
 | REQ-30 | P2 | 交接摘要续聊（/resume-claude /resume-codex） | ✅ cee6153 |
-| REQ-31 | P3 | 竞品 / 官方能力监控（周期性） | ✅ |
+| REQ-31 | P3 | 同类生态插件 / 官方能力监控（周期性） | ✅ |
 | REQ-32 | P1 | 内部标记：`session/imported` 事件 | ✅ |
 | REQ-33 | P2 | 导入识别 / 撤回（`list_imported_sessions` + 引导手动删） | ✅ |
 | REQ-34 | P2 | UI 分组：host-only Web 面板 | ✅ 由 REQ-41 Browser 面板取代 |

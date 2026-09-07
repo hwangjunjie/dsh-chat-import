@@ -1,7 +1,7 @@
 {
   "name": "dsh-chat-import",
-  "description": "Import Claude Code / Codex / ChatGPT / Cursor / Gemini / Reasonix / Pi Coding Agent / opencode / ZCode / Grok Build / OpenClaw / Hermes / Kimi CLI / Qoder CLI conversation histories as resumable DeepSeek Harness sessions",
-  "version": "0.6.2",
+  "description": "Import Claude Code / Codex / ChatGPT / Cursor / Gemini / Reasonix / Pi Coding Agent / opencode / ZCode / Grok Build / OpenClaw / Hermes / Kimi CLI / Qoder CLI / WorkBuddy conversation histories as resumable DeepSeek Harness sessions",
+  "version": "0.10.0",
   "type": "module",
   "main": "./index.mjs",
   "types": "./index.d.ts",
@@ -39,6 +39,7 @@
     "ROADMAP.md",
     "CHANGELOG.md",
     "assets/import.svg",
+    "assets/dci-promo.png",
     "LICENSE"
   ],
   "dsh": {
@@ -79,6 +80,7 @@
     "kimi-cli",
     "qoder",
     "qoder-cli",
+    "workbuddy",
     "sqlite",
     "import",
     "jsonl",
@@ -102,6 +104,7 @@
     "coverage": "node --test --experimental-test-coverage --test-coverage-lines=75 \"test/*.test.mjs\"",
     "lint": "eslint .",
     "check:linux": "node .github/scripts/check-linux-compat.mjs",
+    "check:leaks": "node .github/scripts/check-leaks.mjs",
     "build": "node .github/scripts/build-check.mjs",
     "prepack": "npm run build",
     "prepublishOnly": "npm test && git diff --quiet && git diff --cached --quiet && npm pack --dry-run"

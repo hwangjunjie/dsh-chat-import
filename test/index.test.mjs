@@ -13,6 +13,7 @@ import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { resolveRegistryDir, loadImports, rememberImport } from '../lib/imports.mjs'
 import { syncClaudeSession, evaluateWritebackGuards, readFileTailUuid } from '../lib/backfill.mjs'
 import { clearScanCache } from '../lib/discovery.mjs'
+import { clearWorkspacePathCache } from '../lib/cwd-map.mjs'
 import { restampSession } from '../lib/import-core.mjs'
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), 'fixtures')
@@ -101,6 +102,9 @@ function makePersistence() {
       const s = sessions.get(id)
       if (!s) throw new Error('unknown session ' + id)
       return { meta: s.meta, events: s.events.slice(fromSeq) }
+    },
+    async remove(id) {
+      sessions.delete(id)
     },
   }
 }
@@ -227,13 +231,21 @@ function makeCtx(tree, opts = {}) {
       if (services[service] !== undefined) return services[service]
       return undefined
     },
-    // 模拟 Cordis ctx.inject：依赖可用（webServer 在场 / 服务在 ctx 上存在）才同步
-    // 执行回调；缺依赖（noWebServer / commands 缺席）时不执行——对齐真实 Cordis
-    // 「依赖可用再启动回调」语义。
+    // 模拟 Cordis ctx.inject：依赖可用（webServer 在场 / ctx.get 有服务）才同步执行
+    // 回调；缺依赖不执行。回调返回值按 Cordis effect 契约校验（函数/可空/thenable/
+    // 可迭代之外抛 TypeError: Invalid effect）——真实宿主据此拒绝非法 effect（曾令
+    // 桌面端启动崩溃：settings 就绪早、回调同步执行即命中），mock 对齐该校验可让
+    // 同类回归在单测里直接暴露。
     inject(serviceList, cb) {
       const list = Array.isArray(serviceList) ? serviceList : Object.keys(serviceList || {})
-      if (list.every((s) => (s === 'webServer' ? !opts.noWebServer : ctx[s] !== undefined))) return cb(ctx)
-      return undefined
+      if (!list.every((s) => (s === 'webServer' ? !opts.noWebServer : ctx.get(s) !== undefined))) return undefined
+      const effect = cb(ctx)
+      if (effect !== undefined && effect !== null && typeof effect !== 'function') {
+        const invalid = typeof effect !== 'object' ||
+          (!('then' in effect) && !(Symbol.iterator in effect) && !(Symbol.asyncIterator in effect))
+        if (invalid) throw new TypeError('Invalid effect')
+      }
+      return effect
     },
     tools: {
       register(def) { registered.push(def); return () => {} },
@@ -246,29 +258,34 @@ function makeCtx(tree, opts = {}) {
   return { ctx, persistence, attached, registered, reads, writes, webRoutes }
 }
 
-// REQ-32：导入会话日志首事件为 session/imported 标记（seq 0、ignorable），
-// sourcePath 来自工具入参（fs 服务归一化路径）。
-function assertImportedMarker(events, { tool, sourceId, sourcePath }) {
-  const ev = events[0]
-  assert.equal(ev.type, 'session/imported')
-  assert.equal(ev.seq, 0)
-  assert.equal(ev.ignorable, true)
-  assert.equal(ev.data.tool, tool)
-  assert.equal(ev.data.sourceId, sourceId)
-  assert.equal(ev.data.sourcePath, sourcePath)
-  assert.equal(typeof ev.data.importedAt, 'number')
-  assert.ok(ev.data.importedAt > 0)
+// 导入归属外置 registry（issue #34）：0.8.3 起日志不再写 session/imported 标记，
+// 事件 envelope 键收敛在宿主白名单内（type/seq/time/data/surfaceOp/sourceEventSeqs）。
+function assertEnvelopeHygiene(events) {
+  assert.ok(events.every((e) => e.type !== 'session/imported'), '日志不得含 session/imported 标记')
+  const ALLOWED = new Set(['type', 'seq', 'time', 'data', 'surfaceOp', 'sourceEventSeqs'])
+  for (const e of events) {
+    for (const key of Object.keys(e)) {
+      assert.ok(ALLOWED.has(key), '事件 envelope 出现白名单外键: ' + key)
+    }
+    assert.equal(typeof e.seq, 'number')
+    assert.equal(typeof e.time, 'number')
+    assert.notEqual(e.data, undefined)
+  }
 }
 
-test('apply 注册三十二个工具（18 导入 + import_agents + doctor + import_mcp + import_settings + scan_discover + export_claude/codex/kimi + sync_to_claude + REQ-33 识别/撤回 + REQ-56 bundle 导出/还原 + verify_session）', () => {
+test('apply 注册十三个工具（import_chat 分发器 + import_agents + doctor + import_mcp + import_settings + scan_discover + export_chat 三合一 + sync_to_claude + REQ-33 识别/撤回 + REQ-56 bundle 导出/还原 + verify_session）', () => {
   const { ctx, registered } = makeCtx({})
   apply(ctx)
-  assert.equal(registered.length, 32)
+  assert.equal(registered.length, 13)
   const names = registered.map((d) => d.name).sort()
-  assert.deepEqual(names, ['doctor', 'export_bundle', 'export_claude', 'export_codex', 'export_kimi', 'import_agents', 'import_chatgpt', 'import_claude', 'import_codebuddy', 'import_codex', 'import_cursor', 'import_dsh', 'import_gemini', 'import_grokbuild', 'import_hermes', 'import_kimi', 'import_local_jsonl', 'import_mcp', 'import_mimocode', 'import_openclaw', 'import_opencode', 'import_pi', 'import_qoder', 'import_reasonix', 'import_settings', 'import_zcode', 'list_imported_sessions', 'restore_bundle', 'retract_import', 'scan_discover', 'sync_to_claude', 'verify_session'])
+  assert.deepEqual(names, ['doctor', 'export_bundle', 'export_chat', 'import_agents', 'import_chat', 'import_mcp', 'import_settings', 'list_imported_sessions', 'restore_bundle', 'retract_import', 'scan_discover', 'sync_to_claude', 'verify_session'])
   for (const def of registered) {
-    if (['doctor', 'import_mcp', 'import_settings', 'export_claude', 'export_codex', 'export_kimi', 'export_bundle', 'restore_bundle', 'sync_to_claude', 'scan_discover', 'list_imported_sessions', 'retract_import', 'verify_session'].includes(def.name)) {
-      // doctor / MCP / settings / 导出 / bundle / 写回 / 发现 / 识别 / 撤回 / 校验工具：单对象输出 schema（非 oneOf）
+    if (['doctor', 'import_mcp', 'import_settings', 'export_bundle', 'restore_bundle', 'sync_to_claude', 'scan_discover', 'list_imported_sessions', 'retract_import', 'verify_session'].includes(def.name)) {
+      // doctor / MCP / settings / bundle / 写回 / 发现 / 识别 / 撤回 / 校验工具：单对象输出 schema（非 oneOf）
+      assert.equal(def.output.schema.type, 'object')
+      assert.ok(!Array.isArray(def.output.schema.oneOf))
+    } else if (def.name === 'export_chat') {
+      // export_chat 三合一：单对象输出 schema（三态合并，非 oneOf）
       assert.equal(def.output.schema.type, 'object')
       assert.ok(!Array.isArray(def.output.schema.oneOf))
     } else if (def.name === 'import_agents') {
@@ -276,11 +293,40 @@ test('apply 注册三十二个工具（18 导入 + import_agents + doctor + impo
       assert.equal(def.output.schema.type, 'object')
       assert.ok(!Array.isArray(def.output.schema.oneOf))
     } else {
-      // 导入工具：输出 schema 是 oneOf（单文件 / 批量 + REQ-17 dry-run 预览两个变体）
+      // import_chat：输出 schema 是 oneOf（单文件 / 批量 + REQ-17 dry-run 预览两个变体）
+      assert.equal(def.name, 'import_chat')
       assert.ok(Array.isArray(def.output.schema.oneOf))
       assert.equal(def.output.schema.oneOf.length, 4)
     }
   }
+})
+
+// issue #20：DSH 更新后 defineTool 恒暴露 output.render（内部调用 userRender），
+// 缺 render 的工具渲染输出即抛 `userRender is not a function`。回归断言四个直接
+// defineTool 注册、曾漏 render 的工具现均可渲染（返回文本块、不抛错）。
+test('issue #20：doctor/import_agents/import_mcp/import_settings 的 output.render 可用', () => {
+  const { ctx } = makeCtx({})
+  apply(ctx)
+  const doctor = registeredDef(ctx, 'doctor')
+  assert.match(
+    doctor.output.render({}, { ok: true, checks: [{ name: 'registry', ok: true, detail: '1 条' }], issues: [], totals: { records: 1, sessions: 0, missingSessions: 0, skills: 0 } }).map((b) => b.text).join('\n'),
+    /doctor: ok=true/,
+  )
+  const agents = registeredDef(ctx, 'import_agents')
+  assert.match(
+    agents.output.render({ apply: false }, { total: 2, planned: 2, applied: 0, skipped: 0, results: [] }).map((b) => b.text).join('\n'),
+    /预览（dry-run，未落盘）/,
+  )
+  const mcp = registeredDef(ctx, 'import_mcp')
+  assert.match(
+    mcp.output.render({}, { total: 0, servers: [], planText: '# No MCP servers found\n', writtenTo: null }).map((b) => b.text).join('\n'),
+    /MCP 镜像计划/,
+  )
+  const settings = registeredDef(ctx, 'import_settings')
+  assert.match(
+    settings.output.render({}, { total: 0, suggestions: [], sources: [] }).map((b) => b.text).join('\n'),
+    /配置建议：0 条/,
+  )
 })
 
 test('scan_discover：目录探测 claude、注入过滤、schema 稳定、零副作用、缓存命中不重读', async () => {
@@ -343,7 +389,7 @@ test('单文件导入：落盘、归组、返回值符合 schema', async () => {
   const simple = load('sess-simple-001.jsonl')
   const { ctx, persistence, attached } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple })
   apply(ctx)
-  const def = ctx.tools.register.calls ?? registeredDef(ctx)
+  const def = ctx.tools.register.calls ?? chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
 
   assert.equal(value.mode, 'single')
@@ -357,13 +403,14 @@ test('单文件导入：落盘、归组、返回值符合 schema', async () => {
   const violations = validateJsonSchemaValue(def.output.schema, value)
   assert.deepEqual(violations, [])
 
-  // 落盘：meta + 平衡事件；首事件为 session/imported 标记（sourcePath = 工具入参）
+  // 落盘：meta + 平衡事件（归属外置 registry，日志无标记——issue #34）
   const saved = persistence.sessions.get('import-sess-simple-001')
   assert.ok(saved)
   assert.equal(saved.meta.cwd, 'D:\\demo\\proj')
-  assert.equal(saved.events.at(-1).type, 'turn/end')
+  assert.equal(saved.events.at(-1).type, 'session/title')
+  assert.match(saved.events.at(-1).data.title, /^Claude · /)
   assert.ok(saved.events.every((e, i) => e.seq === i))
-  assertImportedMarker(saved.events, { tool: 'claude-code', sourceId: 'sess-simple-001', sourcePath: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
+  assertEnvelopeHygiene(saved.events)
 
   // 归组
   assert.equal(attached.length, 1)
@@ -374,7 +421,7 @@ test('幂等：重复导入同一文件返回 alreadyImported 且不重复落盘
   const simple = load('sess-simple-001.jsonl')
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple })
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const first = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
   const second = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
   assert.equal(first.alreadyImported, false)
@@ -386,7 +433,7 @@ test('REQ-55 归档重导：目标会话归档后重导建后缀新副本，归�
   const simple = load('sess-simple-001.jsonl')
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple })
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
 
   const first = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
   assert.equal(first.sessionId, 'import-sess-simple-001')
@@ -418,7 +465,7 @@ test('REQ-55 归档重导：目标会话归档后重导建后缀新副本，归�
 test('单文件导入工具历史：tool/result 带 sourceEventSeqs', async () => {
   const { ctx } = makeCtx({ 'D:\\demo\\proj\\sess-tool-001.jsonl': load('sess-tool-001.jsonl') })
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj\\sess-tool-001.jsonl' })
   assert.equal(value.mode, 'single')
   assert.equal(value.toolCalls, 1)
@@ -436,7 +483,7 @@ test('目录批量导入：扫描 .jsonl、逐文件独立会话、跳过非 tra
   }
   const { ctx, persistence, attached } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj' })
 
   assert.equal(value.mode, 'batch')
@@ -452,10 +499,10 @@ test('目录批量导入：扫描 .jsonl、逐文件独立会话、跳过非 tra
   assert.equal(persistence.sessions.size, 3)
   assert.equal(attached.length, 3)
 
-  // 逐文件的 sourcePath 是各自 transcript 路径（目录模式每个文件一个源路径）
-  assertImportedMarker(persistence.sessions.get('import-sess-simple-001').events, { tool: 'claude-code', sourceId: 'sess-simple-001', sourcePath: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
-  assertImportedMarker(persistence.sessions.get('import-sess-tool-001').events, { tool: 'claude-code', sourceId: 'sess-tool-001', sourcePath: 'D:\\demo\\proj\\sess-tool-001.jsonl' })
-  assertImportedMarker(persistence.sessions.get('import-sess-title-001').events, { tool: 'claude-code', sourceId: 'sess-title-001', sourcePath: 'D:\\demo\\proj\\sub\\sess-title-001.jsonl' })
+  // 逐文件的归属在 imports registry（目录模式每个文件一个源路径）；日志无标记（issue #34）
+  assertEnvelopeHygiene(persistence.sessions.get('import-sess-simple-001').events)
+  assertEnvelopeHygiene(persistence.sessions.get('import-sess-tool-001').events)
+  assertEnvelopeHygiene(persistence.sessions.get('import-sess-title-001').events)
 
   // 输出 schema 校验
   assert.deepEqual(validateJsonSchemaValue(def.output.schema, value), [])
@@ -470,7 +517,7 @@ test('目录批量导入：递归参数（false 时不进子目录）', async ()
   }
   const { ctx } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj', recursive: false })
   assert.equal(value.mode, 'batch')
   assert.equal(value.total, 1) // 只扫顶层 sess-simple-001.jsonl
@@ -484,7 +531,7 @@ test('目录批量导入：已存在会话计入 alreadyImported', async () => {
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   await def.execute({ path: 'D:\\demo\\proj' })
   const second = await def.execute({ path: 'D:\\demo\\proj' })
   assert.equal(second.mode, 'batch')
@@ -500,7 +547,7 @@ test('批量导入：空文件/无内容文件计入 skipped 而非 failed', asy
   }
   const { ctx } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj' })
   assert.equal(value.mode, 'batch')
   assert.equal(value.total, 1)
@@ -521,7 +568,7 @@ test('目录批量导入：subagent 辅助 transcript 跳过，主 transcript �
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj' })
 
   assert.equal(value.mode, 'batch')
@@ -537,7 +584,7 @@ test('目录批量导入：subagent 辅助 transcript 跳过，主 transcript �
   assert.equal(persistence.sessions.size, 1)
   const saved = persistence.sessions.get('import-sess-simple-001')
   assert.ok(saved)
-  assert.equal(saved.events.filter((e) => e.type === 'user/message').length, 1)
+  assert.equal(saved.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user').length, 1)
   assert.equal(saved.events.filter((e) => e.type === 'assistant/message').length, 1)
   assert.deepEqual(validateJsonSchemaValue(def.output.schema, value), [])
 })
@@ -545,7 +592,7 @@ test('目录批量导入：subagent 辅助 transcript 跳过，主 transcript �
 test('单文件导入辅助 transcript：跳过并返回 skipReason', async () => {
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\proj\\agent-abc123.jsonl': load('sess-simple-001.jsonl') })
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj\\agent-abc123.jsonl' })
   assert.equal(value.mode, 'single')
   assert.equal(value.sessionId, 'none')
@@ -561,7 +608,7 @@ test('单文件导入辅助 transcript：跳过并返回 skipReason', async () =
 test('import_codex 单文件导入：落盘、归组、返回值符合 schema', async () => {
   const { ctx, persistence, attached } = makeCtx({ 'D:\\demo\\codex\\simple.jsonl': load('codex-simple.jsonl') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_codex')
+  const def = chatDef(ctx, 'codex')
   const value = await def.execute({ path: 'D:\\demo\\codex\\simple.jsonl' })
 
   assert.equal(value.mode, 'single')
@@ -577,9 +624,10 @@ test('import_codex 单文件导入：落盘、归组、返回值符合 schema', 
   const saved = persistence.sessions.get('import-019e3b3f-636d-7cb3-aaab-0255eb45ad4f')
   assert.ok(saved)
   assert.equal(saved.meta.cwd, 'D:\\demo\\codex-proj')
-  assert.equal(saved.events.at(-1).type, 'turn/end')
+  assert.equal(saved.events.at(-1).type, 'session/title')
+  assert.match(saved.events.at(-1).data.title, /^Codex · /)
   assert.ok(saved.events.every((e, i) => e.seq === i))
-  assertImportedMarker(saved.events, { tool: 'codex', sourceId: '019e3b3f-636d-7cb3-aaab-0255eb45ad4f', sourcePath: 'D:\\demo\\codex\\simple.jsonl' })
+  assertEnvelopeHygiene(saved.events)
   assert.equal(attached.length, 1)
   assert.equal(attached[0].id, 'import-019e3b3f-636d-7cb3-aaab-0255eb45ad4f')
 })
@@ -587,7 +635,7 @@ test('import_codex 单文件导入：落盘、归组、返回值符合 schema', 
 test('import_codex 工具历史：tool/result 带 sourceEventSeqs 且 output 落盘', async () => {
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\codex\\tool.jsonl': load('codex-tool.jsonl') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_codex')
+  const def = chatDef(ctx, 'codex')
   const value = await def.execute({ path: 'D:\\demo\\codex\\tool.jsonl' })
   assert.equal(value.mode, 'single')
   assert.equal(value.toolCalls, 1)
@@ -607,7 +655,7 @@ test('import_codex 目录批量导入：递归扫描、逐文件独立会话、s
   }
   const { ctx, persistence, attached } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_codex')
+  const def = chatDef(ctx, 'codex')
   const value = await def.execute({ path: 'D:\\demo\\codex' })
 
   assert.equal(value.mode, 'batch')
@@ -623,9 +671,103 @@ test('import_codex 目录批量导入：递归扫描、逐文件独立会话、s
 test('import_codex 幂等：重复导入同一文件已存在则跳过', async () => {
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\codex\\a.jsonl': load('codex-simple.jsonl') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_codex')
+  const def = chatDef(ctx, 'codex')
   const first = await def.execute({ path: 'D:\\demo\\codex\\a.jsonl' })
   const second = await def.execute({ path: 'D:\\demo\\codex\\a.jsonl' })
+  assert.equal(first.alreadyImported, false)
+  assert.equal(second.alreadyImported, true)
+  assert.equal(persistence.sessions.size, 1)
+})
+
+// ---- import_workbuddy 集成 ----
+
+// 合成 WorkBuddy transcript（事件词汇对齐 lib/convert/workbuddy.mjs）。
+const WB_SID = 'wb-sess-0001'
+const WB_CWD = 'D:\\demo\\workbuddy-proj'
+const WB_TS = 1787131157250
+function wbUser(text) {
+  return { id: 'u', timestamp: WB_TS, type: 'message', role: 'user', content: [{ type: 'input_text', text: '<user_query>' + text + '</user_query>' }], sessionId: WB_SID, cwd: WB_CWD }
+}
+function wbAssistant(text) {
+  return { id: 'a', timestamp: WB_TS + 1, type: 'message', role: 'assistant', content: [{ type: 'output_text', text }], sessionId: WB_SID, cwd: WB_CWD }
+}
+function wbReas(text) {
+  return { id: 'r', timestamp: WB_TS + 2, type: 'reasoning', rawContent: [{ type: 'reasoning_text', text }], sessionId: WB_SID, cwd: WB_CWD }
+}
+function wbCall(callId, name, args) {
+  return { id: 'c', timestamp: WB_TS + 3, type: 'function_call', callId, name, arguments: JSON.stringify(args), status: 'completed', sessionId: WB_SID, cwd: WB_CWD }
+}
+function wbResult(callId, text) {
+  return { id: 'x', timestamp: WB_TS + 4, type: 'function_call_result', callId, name: 'Bash', status: 'completed', output: { type: 'text', text }, sessionId: WB_SID, cwd: WB_CWD }
+}
+function wbTranscript(recs) {
+  return recs.map((r) => JSON.stringify(r)).join('\n')
+}
+
+test('import_workbuddy 单文件导入：落盘、归组、返回值符合 schema', async () => {
+  const src = 'D:\\demo\\workbuddy\\' + WB_SID + '.jsonl'
+  const { ctx, persistence, attached } = makeCtx({ [src]: wbTranscript([
+    wbUser('帮我看看这个项目'),
+    wbReas('先读结构再答'),
+    wbAssistant('好的，我先读一下结构。'),
+  ]) })
+  apply(ctx)
+  const def = chatDef(ctx, 'workbuddy')
+  const value = await def.execute({ path: src })
+
+  assert.equal(value.mode, 'single')
+  assert.equal(value.sessionId, 'import-' + WB_SID)
+  assert.equal(value.turns, 1)
+  assert.equal(value.messages, 2) // user + assistant（环境变更声明不计）
+  assert.equal(value.toolCalls, 0)
+  assert.equal(value.alreadyImported, false)
+  assert.deepEqual(validateJsonSchemaValue(def.output.schema, value), [])
+
+  const saved = persistence.sessions.get('import-' + WB_SID)
+  assert.ok(saved)
+  assert.equal(saved.meta.cwd, WB_CWD)
+  assert.equal(saved.meta.sourceId, WB_SID)
+  assert.equal(saved.events.at(-1).type, 'session/title')
+  assert.match(saved.events.at(-1).data.title, /^WorkBuddy · /)
+  assert.ok(saved.events.every((e, i) => e.seq === i))
+  assertEnvelopeHygiene(saved.events)
+  assert.equal(attached.length, 1)
+  assert.equal(attached[0].id, 'import-' + WB_SID)
+})
+
+test('import_workbuddy 工具历史：tool/result 带 sourceEventSeqs 且 output 落盘', async () => {
+  const src = 'D:\\demo\\workbuddy\\' + WB_SID + '.jsonl'
+  const { ctx, persistence } = makeCtx({ [src]: wbTranscript([
+    wbUser('跑一下测试'),
+    wbReas('用命令跑'),
+    wbAssistant('我用命令跑。'),
+    wbCall('call_1', 'Bash', { command: 'npm test' }),
+    wbResult('call_1', 'ok 42 passed'),
+  ]) })
+  apply(ctx)
+  const def = chatDef(ctx, 'workbuddy')
+  const value = await def.execute({ path: src })
+  assert.equal(value.mode, 'single')
+  assert.equal(value.toolCalls, 1)
+  assert.deepEqual(validateJsonSchemaValue(def.output.schema, value), [])
+
+  const saved = persistence.sessions.get(value.sessionId)
+  const result = saved.events.find((e) => e.type === 'tool/result')
+  assert.ok(result)
+  assert.deepEqual(result.sourceEventSeqs, [saved.events.find((e) => e.type === 'tool/call').seq])
+  assert.equal(result.data.message.content[0].content[0].text, 'ok 42 passed')
+})
+
+test('import_workbuddy 幂等：重复导入同一文件已存在则跳过', async () => {
+  const src = 'D:\\demo\\workbuddy\\' + WB_SID + '.jsonl'
+  const { ctx, persistence } = makeCtx({ [src]: wbTranscript([
+    wbUser('第一问'),
+    wbAssistant('一答'),
+  ]) })
+  apply(ctx)
+  const def = chatDef(ctx, 'workbuddy')
+  const first = await def.execute({ path: src })
+  const second = await def.execute({ path: src })
   assert.equal(first.alreadyImported, false)
   assert.equal(second.alreadyImported, true)
   assert.equal(persistence.sessions.size, 1)
@@ -636,7 +778,7 @@ test('import_codex 幂等：重复导入同一文件已存在则跳过', async (
 test('import_chatgpt 单文件：一文件多会话、恒返回 batch、schema 校验', async () => {
   const { ctx, persistence, attached } = makeCtx({ 'D:\\demo\\chatgpt\\conversations.json': load('chatgpt-export.json') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_chatgpt')
+  const def = chatDef(ctx, 'chatgpt')
   const value = await def.execute({ path: 'D:\\demo\\chatgpt\\conversations.json' })
 
   assert.equal(value.mode, 'batch') // 单文件也恒 batch
@@ -654,18 +796,60 @@ test('import_chatgpt 单文件：一文件多会话、恒返回 batch、schema �
   assert.equal(saved1.events.at(-1).type, 'session/title')
   assert.ok(saved1.events.every((e, i) => e.seq === i))
   // 同一文件里的每个会话都带标记，sourcePath 都是 conversations.json（REQ-32）
-  assertImportedMarker(saved1.events, { tool: 'chatgpt', sourceId: 'conv-001', sourcePath: 'D:\\demo\\chatgpt\\conversations.json' })
-  assertImportedMarker(saved2.events, { tool: 'chatgpt', sourceId: 'conv-002', sourcePath: 'D:\\demo\\chatgpt\\conversations.json' })
+  assertEnvelopeHygiene(saved1.events)
+  assertEnvelopeHygiene(saved2.events)
   // ChatGPT 无 cwd → REQ-39-lite 回退归到导出文件所在目录（否则堆进「未分组」找不到）
   assert.equal(attached.length, 2)
   assert.ok(attached.every((a) => a.ws === dirname('D:\\demo\\chatgpt\\conversations.json')))
   assert.deepEqual(attached.map((a) => a.id).sort(), ['import-conv-001', 'import-conv-002'])
 })
 
+test('import_chatgpt 默认开关：无显式参数默认收集 system（默认开启），设置显式 false 还原过滤', async () => {
+  const conv = {
+    id: 'conv-sp-def',
+    title: 'Default switch chat',
+    create_time: 1710000000,
+    mapping: {
+      s1: { id: 's1', parent: null, children: ['u1'], message: { id: 'm0', author: { role: 'system' }, content: { content_type: 'text', parts: ['You are a helpful assistant.'] } } },
+      u1: { id: 'u1', parent: 's1', children: ['a1'], message: { id: 'm1', author: { role: 'user' }, content: { content_type: 'text', parts: ['hi'] } } },
+      a1: { id: 'a1', parent: 'u1', children: [], message: { id: 'm2', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['hello'] } } },
+    },
+  }
+  const pluginEnv = (session) => {
+    const ev = session.events.find((e) => e.data && e.data.source && e.data.source.kind === 'plugin')
+    assert.ok(ev, '环境变更声明存在')
+    return ev.data.content[0].text
+  }
+  // 默认（无 settings 服务 → readImportPrefs 回退默认 true）：system 原文随注入保留
+  {
+    const { ctx, persistence } = makeCtx({ 'D:\\demo\\chatgpt\\sp.json': JSON.stringify([conv]) })
+    apply(ctx)
+    await chatDef(ctx, 'chatgpt').execute({ path: 'D:\\demo\\chatgpt\\sp.json' })
+    const saved = persistence.sessions.get('import-conv-sp-def')
+    assert.ok(saved, '会话落盘')
+    assert.ok(pluginEnv(saved).includes('You are a helpful assistant.'), '默认开启：system 原文随注入保留')
+  }
+  {
+    // 显式存储 false（设置分区关闭）：过滤 system，仅环境变更声明
+    const settingsStub = {
+      register(ns, schema) { return { ns, schema } },
+      get() { return { importSystemPrompt: false } },
+      describe() { return [{ ns: 'chat-import', value: { importSystemPrompt: false }, revision: 1 }] },
+      watch() {},
+      async update() {},
+    }
+    const { ctx, persistence } = makeCtx({ 'D:\\demo\\chatgpt\\sp.json': JSON.stringify([conv]) }, { services: { settings: settingsStub } })
+    apply(ctx)
+    await chatDef(ctx, 'chatgpt').execute({ path: 'D:\\demo\\chatgpt\\sp.json' })
+    const saved = persistence.sessions.get('import-conv-sp-def')
+    assert.ok(!pluginEnv(saved).includes('You are a helpful assistant.'), '显式 false：仅环境变更声明')
+  }
+})
+
 test('import_chatgpt 幂等：重复导入同一文件只落盘一次', async () => {
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\chatgpt\\conversations.json': load('chatgpt-export.json') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_chatgpt')
+  const def = chatDef(ctx, 'chatgpt')
   const first = await def.execute({ path: 'D:\\demo\\chatgpt\\conversations.json' })
   const second = await def.execute({ path: 'D:\\demo\\chatgpt\\conversations.json' })
   assert.equal(first.imported, 2)
@@ -691,7 +875,7 @@ test('REQ-19 import_chatgpt branch:all：多分支会话全部落盘、幂等、
     'D:\\demo\\chatgpt\\branches.json': branchFixture,
   })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_chatgpt')
+  const def = chatDef(ctx, 'chatgpt')
   // 默认 main：只有主线程（b2，最后 child）一个会话
   const main = await def.execute({ path: 'D:\\demo\\chatgpt\\main.json' })
   assert.equal(main.imported, 1)
@@ -719,7 +903,7 @@ test('REQ-55 multi 源归档重导：部分会话归档 → 重导只对归档�
   const file = 'D:\\demo\\chatgpt\\conversations.json'
   const { ctx, persistence } = makeCtx({ [file]: load('chatgpt-export.json') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_chatgpt')
+  const def = chatDef(ctx, 'chatgpt')
   const first = await def.execute({ path: file })
   assert.equal(first.imported, 2)
 
@@ -750,7 +934,7 @@ test('import_chatgpt 目录模式：扫描 .json（非 .jsonl）、递归汇总'
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_chatgpt')
+  const def = chatDef(ctx, 'chatgpt')
   const value = await def.execute({ path: 'D:\\demo\\chatgpt' })
 
   assert.equal(value.mode, 'batch')
@@ -763,7 +947,7 @@ test('import_chatgpt 目录模式：扫描 .json（非 .jsonl）、递归汇总'
 test('import_chatgpt 非法 JSON：计入 skipped 而非 failed', async () => {
   const { ctx } = makeCtx({ 'D:\\demo\\chatgpt\\bad.json': 'not json' })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_chatgpt')
+  const def = chatDef(ctx, 'chatgpt')
   const value = await def.execute({ path: 'D:\\demo\\chatgpt\\bad.json' })
   assert.equal(value.mode, 'batch')
   assert.equal(value.total, 1)
@@ -777,7 +961,7 @@ test('import_chatgpt 非法 JSON：计入 skipped 而非 failed', async () => {
 test('import_cursor 单文件：composer id 从文件名派生、落盘、schema 校验', async () => {
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\cursor\\composer-abc.jsonl': load('cursor-simple.jsonl') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_cursor')
+  const def = chatDef(ctx, 'cursor')
   const value = await def.execute({ path: 'D:\\demo\\cursor\\composer-abc.jsonl' })
 
   assert.equal(value.mode, 'single')
@@ -789,15 +973,46 @@ test('import_cursor 单文件：composer id 从文件名派生、落盘、schema
 
   const saved = persistence.sessions.get('import-composer-abc')
   assert.ok(saved)
-  assert.equal(saved.events.at(-1).type, 'turn/end') // Cursor 无 title，事件以 turn/end 收尾
+  const titleEv = saved.events.find((e) => e.type === 'session/title')
+  assert.ok(titleEv, '应有 session/title 事件')
+  assert.match(titleEv.data.title, /^Cursor · /)
+  assert.equal(saved.events.at(-1).type, 'session/title')
   assert.ok(saved.events.every((e, i) => e.seq === i))
-  assertImportedMarker(saved.events, { tool: 'cursor', sourceId: 'composer-abc', sourcePath: 'D:\\demo\\cursor\\composer-abc.jsonl' })
+  assertEnvelopeHygiene(saved.events)
+})
+
+test('import_cursor replace:true：同 id 覆盖重导，标题与正文更新', async () => {
+  const path = 'D:\\demo\\cursor\\composer-abc.jsonl'
+  const tree = { [path]: load('cursor-simple.jsonl') }
+  const { ctx, persistence } = makeCtx(tree)
+  apply(ctx)
+  const def = chatDef(ctx, 'cursor')
+  const first = await def.execute({ path })
+  assert.equal(first.alreadyImported, false)
+  assert.equal(persistence.sessions.size, 1)
+
+  tree[path] = load('cursor-dual-tool-same-step.jsonl')
+  const replaced = await def.execute({ path, replace: true })
+  assert.equal(replaced.status, 'replaced')
+  assert.equal(replaced.sessionId, 'import-composer-abc')
+  assert.equal(persistence.sessions.size, 1)
+  const saved = persistence.sessions.get('import-composer-abc')
+  assert.ok(saved)
+  const titleEv = saved.events.find((e) => e.type === 'session/title')
+  assert.ok(titleEv)
+  assert.match(titleEv.data.title, /^Cursor · /)
+  const calls = saved.events.filter((e) => e.type === 'tool/call')
+  assert.equal(calls.length, 2)
+  const ids = calls.map((e) => e.data.callId)
+  assert.equal(new Set(ids).size, 2)
+  const user = saved.events.find((e) => e.type === 'user/message' && e.data.source.kind === 'user').data
+  assert.ok(!user.content[0].text.includes('<timestamp>'))
 })
 
 test('import_cursor 幂等：同名 composer 文件不重复落盘', async () => {
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\cursor\\composer-abc.jsonl': load('cursor-simple.jsonl') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_cursor')
+  const def = chatDef(ctx, 'cursor')
   const first = await def.execute({ path: 'D:\\demo\\cursor\\composer-abc.jsonl' })
   const second = await def.execute({ path: 'D:\\demo\\cursor\\composer-abc.jsonl' })
   assert.equal(first.alreadyImported, false)
@@ -814,7 +1029,7 @@ test('import_cursor 目录模式：递归扫描 .jsonl、逐文件独立会话',
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_cursor')
+  const def = chatDef(ctx, 'cursor')
   const value = await def.execute({ path: 'D:\\demo\\cursor' })
 
   assert.equal(value.mode, 'batch')
@@ -825,12 +1040,40 @@ test('import_cursor 目录模式：递归扫描 .jsonl、逐文件独立会话',
   assert.deepEqual(ids, ['import-composer-a', 'import-composer-b'])
 })
 
+test('import_cursor agent-transcripts：slug 解码 meta.cwd 为真实项目路径', async () => {
+  clearWorkspacePathCache()
+  const slug = 'e-RPA-260721-New-Funion-Client-develop'
+  const uuid = 'composer-abc'
+  const path = `C:\\Users\\Administrator\\.cursor\\projects\\${slug}\\agent-transcripts\\${uuid}\\${uuid}.jsonl`
+  const realCwd = 'E:\\RPA-260721-New\\Funion.Client-develop'
+  const storages = join(process.env.DSH_HOME, 'profiles', 'web', 'storages')
+  mkdirSync(storages, { recursive: true })
+  writeFileSync(join(storages, 'workspace.json'), JSON.stringify([{ path: realCwd }]))
+  const tree = {
+    [path]: load('cursor-simple.jsonl'),
+    'E:\\RPA-260721-New': 'dir',
+    [realCwd]: 'dir',
+  }
+  const { ctx, persistence, attached } = makeCtx(tree)
+  apply(ctx)
+  const def = chatDef(ctx, 'cursor')
+  const value = await def.execute({ path })
+
+  assert.equal(value.mode, 'single')
+  assert.equal(value.alreadyImported, false)
+  const saved = persistence.sessions.get('import-composer-abc')
+  assert.ok(saved)
+  assert.equal(saved.meta.cwd, realCwd)
+  assert.equal(attached.length, 1)
+  assert.equal(attached[0].ws, realCwd)
+})
+
 // ---- import_gemini 集成 ----
 
 test('import_gemini 单文件：落盘、归组、schema 校验', async () => {
   const { ctx, persistence, attached } = makeCtx({ 'D:\\demo\\gemini\\session-abc.json': load('gemini-simple.json') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_gemini')
+  const def = chatDef(ctx, 'gemini')
   const value = await def.execute({ path: 'D:\\demo\\gemini\\session-abc.json' })
 
   assert.equal(value.mode, 'single')
@@ -842,9 +1085,10 @@ test('import_gemini 单文件：落盘、归组、schema 校验', async () => {
   const saved = persistence.sessions.get('import-b26d7f99-0116-4d1d-b125-98c228a4b933')
   assert.ok(saved)
   assert.equal(saved.meta.cwd, 'D:\\demo\\gemini-proj')
-  assert.equal(saved.events.at(-1).type, 'turn/end')
+  assert.equal(saved.events.at(-1).type, 'session/title')
+  assert.match(saved.events.at(-1).data.title, /^Gemini · /)
   assert.ok(saved.events.every((e, i) => e.seq === i))
-  assertImportedMarker(saved.events, { tool: 'gemini', sourceId: 'b26d7f99-0116-4d1d-b125-98c228a4b933', sourcePath: 'D:\\demo\\gemini\\session-abc.json' })
+  assertEnvelopeHygiene(saved.events)
   // Gemini 有 cwd → 归组
   assert.equal(attached.length, 1)
 })
@@ -852,7 +1096,7 @@ test('import_gemini 单文件：落盘、归组、schema 校验', async () => {
 test('import_gemini 工具历史：内联 tool/result 落盘', async () => {
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\gemini\\session-tool.json': load('gemini-tool.json') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_gemini')
+  const def = chatDef(ctx, 'gemini')
   const value = await def.execute({ path: 'D:\\demo\\gemini\\session-tool.json' })
   assert.equal(value.toolCalls, 2)
   assert.deepEqual(validateJsonSchemaValue(def.output.schema, value), [])
@@ -873,7 +1117,7 @@ test('import_gemini 目录模式：扫描 .json、递归、逐文件独立会话
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_gemini')
+  const def = chatDef(ctx, 'gemini')
   const value = await def.execute({ path: 'D:\\demo\\gemini' })
 
   assert.equal(value.mode, 'batch')
@@ -886,7 +1130,7 @@ test('import_gemini 目录模式：扫描 .json、递归、逐文件独立会话
 test('import_gemini 非法 JSON：单文件计入 skipped 不落盘', async () => {
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\gemini\\bad.json': 'not json' })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_gemini')
+  const def = chatDef(ctx, 'gemini')
   const value = await def.execute({ path: 'D:\\demo\\gemini\\bad.json' })
   assert.equal(value.mode, 'single')
   assert.equal(value.skipped, 1)
@@ -902,7 +1146,7 @@ test('import_reasonix 单文件：meta 派生 cwd/标题、落盘、schema 校�
     'D:\\demo\\reasonix\\desktop-v2.meta.json': load('reasonix-v2.meta.json'),
   })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_reasonix')
+  const def = chatDef(ctx, 'reasonix')
   const value = await def.execute({ path: 'D:\\demo\\reasonix\\desktop-v2.jsonl' })
 
   assert.equal(value.mode, 'single')
@@ -917,7 +1161,7 @@ test('import_reasonix 单文件：meta 派生 cwd/标题、落盘、schema 校�
   assert.equal(saved.meta.cwd, 'D:\\Reasonix') // meta.workspace → cwd
   assert.equal(saved.events.at(-1).type, 'session/title') // meta.summary → 标题
   assert.ok(saved.events.every((e, i) => e.seq === i))
-  assertImportedMarker(saved.events, { tool: 'reasonix', sourceId: 'desktop-v2', sourcePath: 'D:\\demo\\reasonix\\desktop-v2.jsonl' })
+  assertEnvelopeHygiene(saved.events)
   // cwd → 归组
   assert.equal(attached.length, 1)
   assert.equal(attached[0].id, 'import-desktop-v2')
@@ -937,7 +1181,7 @@ test('import_reasonix 目录模式：递归扫描、排除 WAL 伴生文件、�
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_reasonix')
+  const def = chatDef(ctx, 'reasonix')
   const value = await def.execute({ path: 'D:\\demo\\reasonix' })
 
   assert.equal(value.mode, 'batch')
@@ -948,10 +1192,108 @@ test('import_reasonix 目录模式：递归扫描、排除 WAL 伴生文件、�
   assert.deepEqual(ids, ['import-desktop-a', 'import-desktop-b'])
 })
 
+test('import_reasonix 目录 canonical：只折叠严格前缀且有明确 parent_id 的恢复祖先', async () => {
+  const lines = (items) => items.map(([role, content]) => JSON.stringify({ role, content })).join('\n')
+  const base = lines([['user', 'A'], ['assistant', 'X']])
+  const left = lines([['user', 'A'], ['assistant', 'X'], ['user', 'B'], ['assistant', 'Y']])
+  const right = lines([['user', 'A'], ['assistant', 'X'], ['user', 'C'], ['assistant', 'Z']])
+  const meta = (id, parentId, updatedAt) => JSON.stringify({
+    id,
+    parent_id: parentId,
+    logical_topic_id: 'logical-topic',
+    topic_id: 'storage-topic',
+    topic_title: 'Synthetic research',
+    workspace_root: 'D:\\Synthetic',
+    updated_at: updatedAt,
+  })
+  const tree = {
+    'D:\\demo\\reasonix': 'dir',
+    'D:\\demo\\reasonix\\base.jsonl': base,
+    'D:\\demo\\reasonix\\base.jsonl.meta': meta('root', null, '1'),
+    'D:\\demo\\reasonix\\left.jsonl': left,
+    'D:\\demo\\reasonix\\left.jsonl.meta': meta('left', 'root', '3'),
+    'D:\\demo\\reasonix\\right.jsonl': right,
+    'D:\\demo\\reasonix\\right.jsonl.meta': meta('right', 'root', '2'),
+  }
+  const { ctx, persistence, attached } = makeCtx(tree)
+  apply(ctx)
+  const def = chatDef(ctx, 'reasonix')
+  assert.deepEqual(def.parameters.properties.lineageMode.enum, ['canonical', 'physical'])
+
+  const preview = await def.execute({ path: 'D:\\demo\\reasonix', preview: true })
+  assert.equal(preview.mode, 'batch')
+  assert.equal(preview.total, 2)
+  assert.ok(preview.results.every((item) => /Synthetic research（分支 [12]\/2）/.test(item.title)))
+  assert.deepEqual(preview.results.map((item) => item.cwd), ['D:\\Synthetic', 'D:\\Synthetic'])
+  assert.equal(persistence.sessions.size, 0)
+  assert.equal(attached.length, 0)
+
+  const imported = await def.execute({ path: 'D:\\demo\\reasonix' })
+  assert.equal(imported.total, 2)
+  assert.equal(imported.imported, 2)
+  assert.deepEqual(new Set(persistence.sessions.keys()), new Set(['import-left', 'import-right']))
+  assert.equal(attached.length, 2)
+})
+
+test('import_reasonix 目录 canonical：同 topic 但缺少明确谱系时保留全部文件', async () => {
+  const line = (content) => JSON.stringify({ role: 'user', content })
+  const meta = (id) => JSON.stringify({ id, topic_id: 'shared-topic', topic_title: 'Ambiguous' })
+  const tree = {
+    'D:\\demo\\reasonix': 'dir',
+    'D:\\demo\\reasonix\\base.jsonl': line('A'),
+    'D:\\demo\\reasonix\\base.jsonl.meta': meta('base'),
+    'D:\\demo\\reasonix\\extended.jsonl': line('A') + '\n' + line('B'),
+    'D:\\demo\\reasonix\\extended.jsonl.meta': meta('extended'),
+  }
+  const { ctx, persistence } = makeCtx(tree)
+  apply(ctx)
+  const def = chatDef(ctx, 'reasonix')
+  const value = await def.execute({ path: 'D:\\demo\\reasonix' })
+  assert.equal(value.total, 2)
+  assert.equal(value.imported, 2)
+  assert.deepEqual(new Set(persistence.sessions.keys()), new Set(['import-base', 'import-extended']))
+})
+
+test('import_reasonix 目录 physical：显式恢复每个 JSONL 独立导入', async () => {
+  const line = (content) => JSON.stringify({ role: 'user', content })
+  const meta = (id, parentId) => JSON.stringify({ id, parent_id: parentId, topic_id: 'shared-topic' })
+  const tree = {
+    'D:\\demo\\reasonix': 'dir',
+    'D:\\demo\\reasonix\\base.jsonl': line('A'),
+    'D:\\demo\\reasonix\\base.jsonl.meta': meta('base', null),
+    'D:\\demo\\reasonix\\extended.jsonl': line('A') + '\n' + line('B'),
+    'D:\\demo\\reasonix\\extended.jsonl.meta': meta('extended', 'base'),
+  }
+  const { ctx, persistence } = makeCtx(tree)
+  apply(ctx)
+  const def = chatDef(ctx, 'reasonix')
+  const value = await def.execute({ path: 'D:\\demo\\reasonix', lineageMode: 'physical' })
+  assert.equal(value.total, 2)
+  assert.equal(value.imported, 2)
+  assert.deepEqual(new Set(persistence.sessions.keys()), new Set(['import-base', 'import-extended']))
+})
+
+test('import_reasonix 目录 canonical：无 topic key 的独立现代 meta 文件仍派生 cwd/标题', async () => {
+  const line = (content) => JSON.stringify({ role: 'user', content })
+  const meta = (id) => JSON.stringify({ id, workspace_root: 'D:\\Solo', topic_title: 'Solo topic' })
+  const tree = {
+    'D:\\demo\\reasonix': 'dir',
+    'D:\\demo\\reasonix\\solo.jsonl': line('A'),
+    'D:\\demo\\reasonix\\solo.jsonl.meta': meta('solo'),
+  }
+  const { ctx } = makeCtx(tree)
+  apply(ctx)
+  const def = chatDef(ctx, 'reasonix')
+  const preview = await def.execute({ path: 'D:\\demo\\reasonix', preview: true })
+  assert.equal(preview.total, 1)
+  assert.equal(preview.results[0].cwd, 'D:\\Solo')
+  assert.ok(preview.results[0].title.includes('Solo topic'))
+})
+
 test('import_reasonix 幂等：同名 stem 不重复落盘', async () => {
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\reasonix\\desktop-a.jsonl': load('reasonix-v1.jsonl') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_reasonix')
+  const def = chatDef(ctx, 'reasonix')
   const first = await def.execute({ path: 'D:\\demo\\reasonix\\desktop-a.jsonl' })
   const second = await def.execute({ path: 'D:\\demo\\reasonix\\desktop-a.jsonl' })
   assert.equal(first.alreadyImported, false)
@@ -965,7 +1307,7 @@ test('import_reasonix 幂等：同名 stem 不重复落盘', async () => {
 test('import_pi 单文件：头行 cwd/id 落盘、归组、返回值符合 schema', async () => {
   const { ctx, persistence, attached } = makeCtx({ 'D:\\demo\\pi\\2025-06-01_pi-simple.jsonl': load('pi-simple.jsonl') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_pi')
+  const def = chatDef(ctx, 'pi')
   const value = await def.execute({ path: 'D:\\demo\\pi\\2025-06-01_pi-simple.jsonl' })
 
   assert.equal(value.mode, 'single')
@@ -979,9 +1321,10 @@ test('import_pi 单文件：头行 cwd/id 落盘、归组、返回值符合 sche
   const saved = persistence.sessions.get('import-019f0a11-2222-7333-8444-555566667777')
   assert.ok(saved)
   assert.equal(saved.meta.cwd, 'D:\\demo\\pi-proj')
-  assert.equal(saved.events.at(-1).type, 'turn/end')
+  assert.equal(saved.events.at(-1).type, 'session/title')
+  assert.match(saved.events.at(-1).data.title, /^Pi · /)
   assert.ok(saved.events.every((e, i) => e.seq === i))
-  assertImportedMarker(saved.events, { tool: 'pi-coding-agent', sourceId: '019f0a11-2222-7333-8444-555566667777', sourcePath: 'D:\\demo\\pi\\2025-06-01_pi-simple.jsonl' })
+  assertEnvelopeHygiene(saved.events)
   // cwd → 归组
   assert.equal(attached.length, 1)
   assert.equal(attached[0].id, 'import-019f0a11-2222-7333-8444-555566667777')
@@ -997,7 +1340,7 @@ test('import_pi 目录批量导入：递归扫描、逐文件独立会话、sche
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_pi')
+  const def = chatDef(ctx, 'pi')
   const value = await def.execute({ path: 'D:\\demo\\pi' })
 
   assert.equal(value.mode, 'batch')
@@ -1013,7 +1356,7 @@ test('import_pi 目录批量导入：递归扫描、逐文件独立会话、sche
 test('import_pi 幂等 + fullHistory 入 args 指纹（换值重导 → argsChanged）', async () => {
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\pi\\c.jsonl': load('pi-compaction.jsonl') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_pi')
+  const def = chatDef(ctx, 'pi')
   const first = await def.execute({ path: 'D:\\demo\\pi\\c.jsonl' })
   const second = await def.execute({ path: 'D:\\demo\\pi\\c.jsonl' })
   assert.equal(first.alreadyImported, false)
@@ -1030,7 +1373,7 @@ test('import_pi 幂等 + fullHistory 入 args 指纹（换值重导 → argsChan
 test('import_pi 非 Pi 文件：单文件跳过并返回 skipReason', async () => {
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\pi\\codex.jsonl': load('codex-simple.jsonl') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_pi')
+  const def = chatDef(ctx, 'pi')
   const value = await def.execute({ path: 'D:\\demo\\pi\\codex.jsonl' })
   assert.equal(value.mode, 'single')
   assert.equal(value.sessionId, 'none')
@@ -1156,7 +1499,7 @@ test('import_opencode 单库文件：批量形态、逐会话落盘、schema 校
   const dbPath = makeOpencodeDb(opencodeTestSessions())
   const { ctx, persistence, attached } = makeCtx({}) // stat 不在 tree 里 → 按 DB 文件处理
   apply(ctx)
-  const def = registeredDef(ctx, 'import_opencode')
+  const def = chatDef(ctx, 'opencode')
   const value = await def.execute({ path: dbPath })
 
   assert.equal(value.mode, 'batch') // 单 .db 也恒批量
@@ -1174,7 +1517,7 @@ test('import_opencode 单库文件：批量形态、逐会话落盘、schema 校
   assert.equal(savedA.events.at(-1).type, 'session/title')
   assert.ok(savedA.events.every((e, i) => e.seq === i))
   // 标记：tool=opencode、sourceId=源会话 id、sourcePath=opencode.db 路径（工具入参）
-  assertImportedMarker(savedA.events, { tool: 'opencode', sourceId: 'ses-a', sourcePath: dbPath })
+  assertEnvelopeHygiene(savedA.events)
   // tool/call + tool/result 关联落盘
   const call = savedA.events.find((e) => e.type === 'tool/call')
   const result = savedA.events.find((e) => e.type === 'tool/result')
@@ -1195,7 +1538,7 @@ test('import_opencode 目录模式：自动定位 opencode.db、schema 校验', 
   const dirPath = dirname(dbPath)
   const { ctx, persistence } = makeCtx({ [dirPath]: 'dir' }) // stat 命中 → 目录分支
   apply(ctx)
-  const def = registeredDef(ctx, 'import_opencode')
+  const def = chatDef(ctx, 'opencode')
   const value = await def.execute({ path: dirPath })
 
   assert.equal(value.mode, 'batch')
@@ -1209,7 +1552,7 @@ test('import_opencode sessionIds 过滤：只导指定源会话', async () => {
   const dbPath = makeOpencodeDb(opencodeTestSessions())
   const { ctx, persistence } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_opencode')
+  const def = chatDef(ctx, 'opencode')
   const value = await def.execute({ path: dbPath, sessionIds: ['ses-b'] })
 
   assert.equal(value.mode, 'batch')
@@ -1225,7 +1568,7 @@ test('import_opencode 幂等：重复导入同一库只落盘一次', async () =
   const dbPath = makeOpencodeDb(opencodeTestSessions())
   const { ctx, persistence } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_opencode')
+  const def = chatDef(ctx, 'opencode')
   const first = await def.execute({ path: dbPath })
   const second = await def.execute({ path: dbPath })
 
@@ -1276,19 +1619,19 @@ test('import_opencode fullHistory：true 导入全量历史', async () => {
   const dbPath = makeOpencodeDb([opencodeCompactedSession()])
   const { ctx, persistence } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_opencode')
+  const def = chatDef(ctx, 'opencode')
   const value = await def.execute({ path: dbPath, fullHistory: true })
   assert.equal(value.imported, 1)
   const saved = persistence.sessions.get('import-ses-comp')
   assert.ok(saved)
-  assert.equal(saved.events.filter((e) => e.type === 'user/message').length, 2) // c1 + c3（c5 无正文被跳过）
+  assert.equal(saved.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user').length, 2) // c1 + c3（c5 无正文被跳过）
   assert.equal(saved.events.filter((e) => e.type === 'assistant/message').length, 3) // c2 + c4 + c6
 })
 
 test('import_opencode 读不到 DB：失败大声抛错', async () => {
   const { ctx } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_opencode')
+  const def = chatDef(ctx, 'opencode')
   await assert.rejects(() => def.execute({ path: join(tmpdir(), 'no-such-opencode.db') }))
 })
 
@@ -1317,7 +1660,7 @@ test('import_grokbuild 单会话目录：双文件转换、落盘、归组、sch
   }
   const { ctx, persistence, attached } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_grokbuild')
+  const def = chatDef(ctx, 'grokbuild')
   const value = await def.execute({ path: dir })
 
   assert.equal(value.mode, 'single')
@@ -1334,10 +1677,10 @@ test('import_grokbuild 单会话目录：双文件转换、落盘、归组、sch
   assert.equal(saved.meta.sourceId, 'grok-sess-001')
   // 显式标题（generated_title）钉 session/title 事件
   assert.equal(saved.events.at(-1).type, 'session/title')
-  assert.equal(saved.events.at(-1).data.title, 'Grok 会话标题')
+  assert.equal(saved.events.at(-1).data.title, 'Grok · Grok 会话标题')
   assert.ok(saved.events.every((e, i) => e.seq === i))
   // 幂等键 = 会话目录路径
-  assertImportedMarker(saved.events, { tool: 'grokbuild', sourceId: 'grok-sess-001', sourcePath: dir })
+  assertEnvelopeHygiene(saved.events)
   assert.equal(attached.length, 1)
   assert.equal(attached[0].id, 'import-grok-sess-001')
 })
@@ -1359,7 +1702,7 @@ test('import_grokbuild 目录批量：递归扫 summary.json、逐会话独立�
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_grokbuild')
+  const def = chatDef(ctx, 'grokbuild')
   const value = await def.execute({ path: root })
 
   assert.equal(value.mode, 'batch')
@@ -1377,7 +1720,7 @@ test('import_grokbuild 增量续写：chat_history 增长 → appended 同一会
   const tree = { [dir]: 'dir', [dir + '\\summary.json']: summary, [dir + '\\chat_history.jsonl']: grokChat(2) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_grokbuild')
+  const def = chatDef(ctx, 'grokbuild')
   const first = await def.execute({ path: dir })
   assert.equal(first.status, 'imported')
   const before = persistence.sessions.get('import-grok-sess-incr').events.length
@@ -1411,7 +1754,7 @@ test('import_openclaw 单文件：displayName 从同目录 sessions.json 派生�
   }
   const { ctx, persistence, attached } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_openclaw')
+  const def = chatDef(ctx, 'openclaw')
   const value = await def.execute({ path: 'D:\\demo\\openclaw\\sess-openclaw-001.jsonl' })
 
   assert.equal(value.mode, 'single')
@@ -1427,9 +1770,9 @@ test('import_openclaw 单文件：displayName 从同目录 sessions.json 派生�
   assert.equal(saved.meta.sourceId, 'sess-openclaw-001')
   // displayName（sessions.json 索引）→ 标题钉 session/title 事件
   assert.equal(saved.events.at(-1).type, 'session/title')
-  assert.equal(saved.events.at(-1).data.title, '重构登录模块')
+  assert.equal(saved.events.at(-1).data.title, 'OpenClaw · 重构登录模块')
   assert.ok(saved.events.every((e, i) => e.seq === i))
-  assertImportedMarker(saved.events, { tool: 'openclaw', sourceId: 'sess-openclaw-001', sourcePath: 'D:\\demo\\openclaw\\sess-openclaw-001.jsonl' })
+  assertEnvelopeHygiene(saved.events)
   assert.equal(attached.length, 1)
   assert.equal(attached[0].id, 'import-sess-openclaw-001')
 })
@@ -1451,7 +1794,7 @@ test('import_openclaw 目录批量：递归扫 .jsonl、逐文件独立会话、
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_openclaw')
+  const def = chatDef(ctx, 'openclaw')
   const value = await def.execute({ path: 'D:\\demo\\openclaw\\agents\\main\\sessions' })
 
   assert.equal(value.mode, 'batch')
@@ -1476,7 +1819,7 @@ test('import_openclaw 幂等：重复导入同一文件已存在则跳过', asyn
   }
   const { ctx, persistence } = makeCtx(tree) // 无 sessions.json：deriveArgs 吞缺索引，仅无 displayName
   apply(ctx)
-  const def = registeredDef(ctx, 'import_openclaw')
+  const def = chatDef(ctx, 'openclaw')
   const first = await def.execute({ path: 'D:\\demo\\openclaw\\sess-static.jsonl' })
   const second = await def.execute({ path: 'D:\\demo\\openclaw\\sess-static.jsonl' })
   assert.equal(first.alreadyImported, false)
@@ -1516,7 +1859,7 @@ test('import_hermes SQLite：state.db 恒批量、逐会话落盘、归组、sch
   const dbPath = makeHermesTestDb()
   const { ctx, persistence, attached } = makeCtx({}) // stat 回退 node:fs（真实 db 文件）
   apply(ctx)
-  const def = registeredDef(ctx, 'import_hermes')
+  const def = chatDef(ctx, 'hermes')
   const value = await def.execute({ path: dbPath })
 
   assert.equal(value.mode, 'batch') // 单 .db 也恒批量
@@ -1530,9 +1873,9 @@ test('import_hermes SQLite：state.db 恒批量、逐会话落盘、归组、sch
   assert.ok(savedA)
   assert.equal(savedA.meta.cwd, 'E:/demo/hermes')
   assert.equal(savedA.events.at(-1).type, 'session/title')
-  assert.equal(savedA.events.at(-1).data.title, 'Fix hermes build')
+  assert.equal(savedA.events.at(-1).data.title, 'Hermes · Fix hermes build')
   assert.ok(savedA.events.every((e, i) => e.seq === i))
-  assertImportedMarker(savedA.events, { tool: 'hermes', sourceId: 'hm-a', sourcePath: dbPath })
+  assertEnvelopeHygiene(savedA.events)
   const ids = [...persistence.sessions.keys()].sort()
   assert.deepEqual(ids, ['import-hm-a', 'import-hm-b'])
   assert.equal(attached.length, 2) // 两个会话都有 cwd → 归组
@@ -1542,7 +1885,7 @@ test('import_hermes db 增量续写：库增长 → 逐会话 append（REQ-24）
   const dbPath = makeHermesTestDb()
   const { ctx, persistence } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_hermes')
+  const def = chatDef(ctx, 'hermes')
   const first = await def.execute({ path: dbPath })
   assert.equal(first.imported, 2)
   const before = persistence.sessions.get('import-hm-a').events.length
@@ -1570,7 +1913,7 @@ test('import_hermes JSONL 回退：目录无可用 state.db → 递归扫 .jsonl
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_hermes')
+  const def = chatDef(ctx, 'hermes')
   const value = await def.execute({ path: 'D:\\demo\\hermes\\sessions' })
 
   assert.equal(value.mode, 'batch')
@@ -1588,7 +1931,7 @@ test('import_hermes 单 .jsonl：db 之外的单会话源，mode single', async 
   const raw = JSON.stringify({ role: 'user', content: 'hi', ts: 1 }) + '\n' + JSON.stringify({ role: 'assistant', content: 'hello', ts: 2 }) + '\n'
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\hermes\\sessions\\s1.jsonl': raw })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_hermes')
+  const def = chatDef(ctx, 'hermes')
   const value = await def.execute({ path: 'D:\\demo\\hermes\\sessions\\s1.jsonl' })
   assert.equal(value.mode, 'single')
   assert.equal(value.sessionId, 'import-s1') // fileStem 兜底
@@ -1607,7 +1950,7 @@ test('REQ-72 expectedHash: 正确哈希导入成功，错误哈希失败且不�
   const path = 'D:\\demo\\proj\\sess-hash-001.jsonl'
   const { ctx, persistence } = makeCtx({ [path]: raw })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_claude')
+  const def = chatDef(ctx, 'claude')
   const hash = createHash('sha256').update(raw).digest('hex')
 
   const ok = await def.execute({ path, expectedHash: hash })
@@ -1644,7 +1987,7 @@ test('REQ-70 import_claude workspaceMode=dedicated: 导入会话挂到专用工�
   const { ctx, attached } = makeCtx({ [path]: raw })
   apply(ctx)
   const dedicatedDir = join(mkdtempSync(join(tmpdir(), 'dsh-ws-mode-')), 'workspace')
-  const def = registeredDef(ctx, 'import_claude')
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path, workspaceMode: 'dedicated', workspaceDir: dedicatedDir })
   assert.equal(value.status, 'imported')
   assert.ok(attached.some((a) => a.ws === dedicatedDir), '挂到 dedicated workspace: ' + JSON.stringify(attached))
@@ -1688,7 +2031,7 @@ test('import_kimi 单会话目录：wire.jsonl + state.json + kimi.json 映射�
   }
   const { ctx, persistence, attached } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_kimi')
+  const def = chatDef(ctx, 'kimi')
   const value = await def.execute({ path: sess })
 
   assert.equal(value.mode, 'single')
@@ -1705,10 +2048,10 @@ test('import_kimi 单会话目录：wire.jsonl + state.json + kimi.json 映射�
   assert.equal(saved.meta.sourceId, 'sess-001')
   // 显式标题（state.json custom_title）钉 session/title 事件
   assert.equal(saved.events.at(-1).type, 'session/title')
-  assert.equal(saved.events.at(-1).data.title, 'Kimi 会话标题')
+  assert.equal(saved.events.at(-1).data.title, 'Kimi · Kimi 会话标题')
   assert.ok(saved.events.every((e, i) => e.seq === i))
   // 幂等键 = 会话目录路径
-  assertImportedMarker(saved.events, { tool: 'kimi', sourceId: 'sess-001', sourcePath: sess })
+  assertEnvelopeHygiene(saved.events)
   assert.equal(attached.length, 1)
   assert.equal(attached[0].id, 'import-sess-001')
 })
@@ -1735,7 +2078,7 @@ test('import_kimi 目录批量：递归扫 wire.jsonl、逐会话独立落盘、
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_kimi')
+  const def = chatDef(ctx, 'kimi')
   const value = await def.execute({ path: 'D:\\demo\\kimi\\sessions' })
 
   assert.equal(value.mode, 'batch')
@@ -1767,7 +2110,7 @@ test('import_kimi 增量续写：wire.jsonl 增长 → appended 同一会话（R
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_kimi')
+  const def = chatDef(ctx, 'kimi')
   const first = await def.execute({ path: sess })
   assert.equal(first.status, 'imported')
   const before = persistence.sessions.get('import-sess-incr').events.length
@@ -1788,7 +2131,7 @@ test('import_kimi 增量续写：wire.jsonl 增长 → appended 同一会话（R
   assert.ok(saved.events.every((e, i) => e.seq === i))
   assert.equal(saved.events.length, before + second.appendedEvents)
   assert.equal(saved.events.filter((e) => e.type === 'turn/start').length, 2)
-  assert.equal(saved.events.filter((e) => e.type === 'session/title').length, 0)
+  assert.equal(saved.events.filter((e) => e.type === 'session/title').length, 1)
   assert.deepEqual(validateJsonSchemaValue(def.output.schema, second), [])
 })
 
@@ -1805,7 +2148,7 @@ test('import_kimi 单 wire.jsonl 文件：mode single、kimiId 从父目录派�
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_kimi')
+  const def = chatDef(ctx, 'kimi')
   const value = await def.execute({ path: wirePath })
   assert.equal(value.mode, 'single')
   assert.equal(value.sessionId, 'import-sess-f') // 父目录名作源 id
@@ -1822,7 +2165,7 @@ test('import_kimi 非会话目录：批量跳过（无用户回合）', async ()
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_kimi')
+  const def = chatDef(ctx, 'kimi')
   const value = await def.execute({ path: 'D:\\demo\\kimi\\sessions' })
   assert.equal(value.mode, 'batch')
   assert.equal(value.total, 0)
@@ -1848,7 +2191,7 @@ test('import_kimi dry-run 预览：preview 零副作用、0 skipped、清单字�
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_kimi')
+  const def = chatDef(ctx, 'kimi')
   const value = await def.execute({ path: sess, preview: true })
   assert.equal(value.mode, 'single')
   assert.equal(value.preview, true)
@@ -1880,7 +2223,7 @@ test('import_kimi 新 Kimi Code 单会话目录：agents/main/wire.jsonl + state
   }
   const { ctx, persistence, attached } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_kimi')
+  const def = chatDef(ctx, 'kimi')
   const value = await def.execute({ path: sess })
 
   assert.equal(value.mode, 'single')
@@ -1895,8 +2238,8 @@ test('import_kimi 新 Kimi Code 单会话目录：agents/main/wire.jsonl + state
   assert.equal(saved.meta.cwd, 'C:/Users/u/proj') // state.json.cwd
   assert.equal(saved.meta.sourceId, 'session-001')
   assert.equal(saved.events.at(-1).type, 'session/title')
-  assert.equal(saved.events.at(-1).data.title, '新 Kimi Code 标题') // isCustomTitle:true 钉标题
-  assertImportedMarker(saved.events, { tool: 'kimi', sourceId: 'session-001', sourcePath: sess })
+  assert.equal(saved.events.at(-1).data.title, 'Kimi · 新 Kimi Code 标题') // isCustomTitle:true 钉标题
+  assertEnvelopeHygiene(saved.events)
   assert.equal(attached.length, 1)
 })
 
@@ -1925,7 +2268,7 @@ test('import_kimi 新 Kimi Code 目录批量：递归扫 agents/main/wire.jsonl'
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_kimi')
+  const def = chatDef(ctx, 'kimi')
   const value = await def.execute({ path: 'C:\\Users\\u\\.kimi-code\\sessions' })
 
   assert.equal(value.mode, 'batch')
@@ -1944,7 +2287,7 @@ test('REQ-24 增长 append：同一会话 seq 连续、只新增轮次、无重�
   const tree = { 'D:\\demo\\proj\\sess-incr-001.jsonl': claudeTurns(2) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const first = await def.execute({ path: 'D:\\demo\\proj\\sess-incr-001.jsonl' })
   assert.equal(first.status, 'imported')
   assert.equal(first.turns, 2)
@@ -1970,9 +2313,8 @@ test('REQ-24 增长 append：同一会话 seq 连续、只新增轮次、无重�
   // 续写轮次：turn 续号用源编号（3），末尾 turn/end 平衡
   assert.equal(saved2.events.at(-1).type, 'turn/end')
   assert.equal(saved2.events.at(-1).data.turn, 3)
-  // 不重复写 session/imported 标记与 session/title
-  assert.equal(saved2.events.filter((e) => e.type === 'session/imported').length, 1)
-  assert.equal(saved2.events.filter((e) => e.type === 'session/title').length, 0)
+  // 续写不重复钉 session/title（标记自 0.8.3 起不再写入，见 issue #34）
+  assert.equal(saved2.events.filter((e) => e.type === 'session/title').length, 1)
   // 已导入前缀事件未被改写
   assert.deepEqual(saved2.events.slice(0, before), firstEvents)
 })
@@ -1981,7 +2323,7 @@ test('REQ-24 未变跳过：version/size 短路径不 readText，已存在不重
   const tree = { 'D:\\demo\\proj\\sess-incr-001.jsonl': claudeTurns(2) }
   const { ctx, persistence, reads } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const first = await def.execute({ path: 'D:\\demo\\proj\\sess-incr-001.jsonl' })
   assert.equal(reads.count, 1)
   assert.equal(first.status, 'imported')
@@ -1998,7 +2340,7 @@ test('REQ-24 sourceShrunk：源文件轮次减少 → 跳过报告，不破坏�
   const tree = { 'D:\\demo\\proj\\sess-incr-001.jsonl': claudeTurns(3) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   await def.execute({ path: 'D:\\demo\\proj\\sess-incr-001.jsonl' })
   const before = persistence.sessions.get('import-sess-incr-001').events.length
 
@@ -2024,7 +2366,7 @@ test('REQ-24 changedInPlace：轮数相等但事件增长 → 跳过（append-on
   const tree = { 'D:\\demo\\proj\\sess-incr-001.jsonl': v1 }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   await def.execute({ path: 'D:\\demo\\proj\\sess-incr-001.jsonl' })
   const before = persistence.sessions.get('import-sess-incr-001').events.length
 
@@ -2039,7 +2381,7 @@ test('REQ-24 force:true：新 id 完整副本，旧会话原样保留', async ()
   const tree = { 'D:\\demo\\proj\\sess-incr-001.jsonl': claudeTurns(2) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   await def.execute({ path: 'D:\\demo\\proj\\sess-incr-001.jsonl' })
   const oldEvents = persistence.sessions.get('import-sess-incr-001').events
 
@@ -2072,7 +2414,7 @@ test('REQ-24 两路径共享 sessionId：都导入、后缀避让、互不覆盖
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const ra = await def.execute({ path: 'D:\\demo\\proj\\a\\shared-session.jsonl' })
   const rb = await def.execute({ path: 'D:\\demo\\proj\\b\\shared-session.jsonl' })
   assert.equal(ra.status, 'imported')
@@ -2095,7 +2437,7 @@ test('REQ-24 legacy 回填：registry 丢失但会话在 → already-imported + 
   const tree = { 'D:\\demo\\proj\\sess-incr-001.jsonl': claudeTurns(2) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   await def.execute({ path: 'D:\\demo\\proj\\sess-incr-001.jsonl' })
   assert.equal(persistence.sessions.size, 1)
 
@@ -2123,7 +2465,7 @@ test('REQ-24 用户 DSH 续聊后 append：fromSeq 取 inspect 权威游标，se
   const tree = { 'D:\\demo\\proj\\sess-incr-001.jsonl': claudeTurns(2) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   await def.execute({ path: 'D:\\demo\\proj\\sess-incr-001.jsonl' })
   const saved1 = persistence.sessions.get('import-sess-incr-001')
   const base = saved1.events.length
@@ -2153,7 +2495,7 @@ test('REQ-24 显式 sessionId 变更：以新 id 建完整副本（force 副本�
   const tree = { 'D:\\demo\\proj\\sess-incr-001.jsonl': claudeTurns(2) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const first = await def.execute({ path: 'D:\\demo\\proj\\sess-incr-001.jsonl', sessionId: 'custom-a' })
   assert.equal(first.sessionId, 'custom-a')
 
@@ -2176,7 +2518,7 @@ test('REQ-24 损坏 registry 容错：按空 registry 处理并继续导入', as
   const tree = { 'D:\\demo\\proj\\sess-incr-001.jsonl': claudeTurns(2) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj\\sess-incr-001.jsonl' })
   assert.equal(value.status, 'imported')
   assert.equal(persistence.sessions.size, 1)
@@ -2193,7 +2535,7 @@ test('REQ-24 batch 汇总：目录内单文件增长 → appended 计数与结�
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const first = await def.execute({ path: 'D:\\demo\\proj' })
   assert.equal(first.imported, 2)
   assert.equal(first.appended, 0)
@@ -2224,7 +2566,7 @@ test('REQ-24 ChatGPT 多会话：逐会话增长 append / 新增 / 消失 missin
   const tree = { 'D:\\demo\\chatgpt\\conversations.json': v1 }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_chatgpt')
+  const def = chatDef(ctx, 'chatgpt')
   const first = await def.execute({ path: 'D:\\demo\\chatgpt\\conversations.json' })
   assert.equal(first.imported, 2)
   assert.equal(persistence.sessions.size, 2)
@@ -2253,7 +2595,7 @@ test('REQ-24 opencode DB 增长 append：同库新增轮次续写同一会话', 
   const dbPath = makeOpencodeDb(opencodeTestSessions())
   const { ctx, persistence } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_opencode')
+  const def = chatDef(ctx, 'opencode')
   const first = await def.execute({ path: dbPath })
   assert.equal(first.imported, 2)
   const before = persistence.sessions.get('import-ses-a').events.length
@@ -2279,7 +2621,7 @@ test('REQ-24 opencode 消息删除（turns 变少）→ sourceShrunk 跳过', as
   addOpencodeTurn(dbPath, 'ses-a', 'msg-a3', '继续追问', '追加回答', 1786000000100)
   const { ctx, persistence } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_opencode')
+  const def = chatDef(ctx, 'opencode')
   await def.execute({ path: dbPath })
   const before = persistence.sessions.get('import-ses-a').events.length
 
@@ -2297,7 +2639,7 @@ test('REQ-24 opencode fullHistory 入 args 指纹：参数变化 → args-change
   const dbPath = makeOpencodeDb(opencodeTestSessions())
   const { ctx, persistence } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_opencode')
+  const def = chatDef(ctx, 'opencode')
   await def.execute({ path: dbPath }) // 默认（尊重压缩）
   const second = await def.execute({ path: dbPath, fullHistory: true })
   assert.equal(second.mode, 'batch')
@@ -2316,7 +2658,7 @@ test('REQ-24 opencode 未变 DB：短路径跳过（version/size 不变）', asy
   const dbPath = makeOpencodeDb(opencodeTestSessions())
   const { ctx, persistence } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_opencode')
+  const def = chatDef(ctx, 'opencode')
   await def.execute({ path: dbPath })
   const second = await def.execute({ path: dbPath })
   assert.equal(second.imported, 0)
@@ -2343,10 +2685,10 @@ test('export_claude 落盘：import → export 闭环、路径 <outputDir>/<slug
   const tree = { 'D:\\demo\\proj\\sess-simple-001.jsonl': load('sess-simple-001.jsonl') }
   const { ctx, persistence, writes } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
+  await chatDef(ctx, 'claude').execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
   assert.equal(persistence.sessions.size, 1)
 
-  const def = registeredDef(ctx, 'export_claude')
+  const def = exportDef(ctx, 'claude')
   const value = await def.execute({ sessionId: 'import-sess-simple-001', outputDir: OUT })
 
   assert.equal(value.mode, 'single')
@@ -2354,9 +2696,9 @@ test('export_claude 落盘：import → export 闭环、路径 <outputDir>/<slug
   assert.equal(value.slug, 'D--demo-proj') // D:\demo\proj → ':'、'\'、'\' 各一个 '-'
   assert.equal(value.cwd, 'D:\\demo\\proj')
   assert.match(value.sessionId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
-  assert.equal(value.recordCount, 4) // mode + permission-mode + user + assistant
+  assert.equal(value.recordCount, 5) // mode + permission-mode + user + ai-title + assistant（环境变更声明被跳过）
   assert.equal(value.mapping.turns, 1)
-  assert.equal(value.mapping.messages, 2)
+  assert.equal(value.mapping.messages, 3) // 环境变更声明 + user + assistant（原样计数，导出时跳过）
   assert.equal(value.mapping.toolCalls, 0)
   assert.equal(value.mapping.toolResults, 0)
   assert.equal(value.dryRun, false)
@@ -2370,7 +2712,7 @@ test('export_claude 落盘：import → export 闭环、路径 <outputDir>/<slug
   const body = writes[0].content.slice(0, -1)
   assert.equal(writes[0].content.endsWith('\n'), true)
   const lines = body.split('\n').map((l) => JSON.parse(l))
-  assert.equal(lines.length, 4)
+  assert.equal(lines.length, 5)
   assert.equal(lines[0].type, 'mode')
   const pm = lines[1]
   assert.deepEqual(Object.keys(pm).sort(), ['permissionMode', 'sessionId', 'type'])
@@ -2379,7 +2721,9 @@ test('export_claude 落盘：import → export 闭环、路径 <outputDir>/<slug
   assert.equal(user.parentUuid, null)
   assert.equal(typeof user.message.content, 'string')
   assert.equal(user.cwd, 'D:\\demo\\proj')
-  const asst = lines[3]
+  const title = lines[3]
+  assert.equal(title.type, 'ai-title')
+  const asst = lines[4]
   assert.equal(asst.type, 'assistant')
   assert.equal(asst.parentUuid, user.uuid)
   assert.equal(asst.message.stop_reason, 'end_turn')
@@ -2389,9 +2733,9 @@ test('export_claude 带标题会话：ai-title 放首个 user 后、assistant �
   const tree = { 'D:\\demo\\proj\\sess-title-001.jsonl': load('sess-title-001.jsonl') }
   const { ctx, writes } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: 'D:\\demo\\proj\\sess-title-001.jsonl' })
+  await chatDef(ctx, 'claude').execute({ path: 'D:\\demo\\proj\\sess-title-001.jsonl' })
 
-  const def = registeredDef(ctx, 'export_claude')
+  const def = exportDef(ctx, 'claude')
   const value = await def.execute({ sessionId: 'import-sess-title-001', outputDir: OUT })
   assert.equal(value.recordCount, 5) // mode + permission-mode + user + ai-title + assistant
   assert.equal(typeof value.title, 'string')
@@ -2411,17 +2755,17 @@ test('export_claude 工具会话：tool_use/tool_result 配对、sourceToolAssis
   const tree = { 'D:\\demo\\proj\\sess-tool-001.jsonl': load('sess-tool-001.jsonl') }
   const { ctx, writes } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: 'D:\\demo\\proj\\sess-tool-001.jsonl' })
+  await chatDef(ctx, 'claude').execute({ path: 'D:\\demo\\proj\\sess-tool-001.jsonl' })
 
-  const def = registeredDef(ctx, 'export_claude')
+  const def = exportDef(ctx, 'claude')
   const value = await def.execute({ sessionId: 'import-sess-tool-001', outputDir: OUT })
-  assert.equal(value.recordCount, 6) // mode + permission-mode + user + assistant + tool_result + assistant
+  assert.equal(value.recordCount, 7) // mode + permission-mode + user + ai-title + assistant + tool_result + assistant
   assert.equal(value.mapping.toolCalls, 1)
   assert.equal(value.mapping.toolResults, 1)
   assert.deepEqual(validateJsonSchemaValue(def.output.schema, value), [])
 
   const lines = writes[0].content.slice(0, -1).split('\n').map((l) => JSON.parse(l))
-  const asst1 = lines[3]
+  const asst1 = lines[4]
   const thinking = asst1.message.content.find((b) => b.type === 'thinking')
   assert.deepEqual(thinking, { type: 'thinking', thinking: thinking.thinking, signature: '' })
   const toolUse = asst1.message.content.find((b) => b.type === 'tool_use')
@@ -2430,7 +2774,7 @@ test('export_claude 工具会话：tool_use/tool_result 配对、sourceToolAssis
   assert.deepEqual(toolUse.input, { command: 'ls -la' })
   assert.equal(asst1.message.stop_reason, 'tool_use')
 
-  const tr = lines[4]
+  const tr = lines[5]
   assert.equal(tr.type, 'user')
   assert.equal(tr.parentUuid, asst1.uuid)
   assert.equal(tr.sourceToolAssistantUUID, asst1.uuid)
@@ -2438,21 +2782,21 @@ test('export_claude 工具会话：tool_use/tool_result 配对、sourceToolAssis
   assert.equal(tr.message.content[0].tool_use_id, 'toolu_01')
   assert.equal(tr.message.content[0].content, 'README.md\nsrc\n')
   assert.equal(Object.hasOwn(tr.message.content[0], 'is_error'), false) // fixture is_error:false → 不写
-  assert.equal(lines[5].message.stop_reason, 'end_turn')
+  assert.equal(lines[6].message.stop_reason, 'end_turn')
 })
 
 test('export_claude dryRun：不写盘、返回目标路径与统计', async () => {
   const tree = { 'D:\\demo\\proj\\sess-simple-001.jsonl': load('sess-simple-001.jsonl') }
   const { ctx, writes } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
+  await chatDef(ctx, 'claude').execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
 
-  const def = registeredDef(ctx, 'export_claude')
+  const def = exportDef(ctx, 'claude')
   const value = await def.execute({ sessionId: 'import-sess-simple-001', outputDir: OUT, dryRun: true })
   assert.equal(value.dryRun, true)
   assert.equal(writes.length, 0) // 不写盘
   assert.equal(typeof value.filePath, 'string')
-  assert.equal(value.recordCount, 4)
+  assert.equal(value.recordCount, 5)
   assert.deepEqual(validateJsonSchemaValue(def.output.schema, value), [])
 })
 
@@ -2460,9 +2804,9 @@ test('export_claude cwd 覆盖：slug/记录 cwd 用入参而非 header', async 
   const tree = { 'D:\\demo\\proj\\sess-simple-001.jsonl': load('sess-simple-001.jsonl') }
   const { ctx, writes } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
+  await chatDef(ctx, 'claude').execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
 
-  const value = await registeredDef(ctx, 'export_claude').execute({
+  const value = await exportDef(ctx, 'claude').execute({
     sessionId: 'import-sess-simple-001',
     outputDir: OUT,
     cwd: "C:\\Users\\Meier's\\work", // 含非字母数字：验证 slug 替换
@@ -2477,7 +2821,7 @@ test('export_claude cwd 覆盖：slug/记录 cwd 用入参而非 header', async 
 test('export_claude 会话不存在：抛错', async () => {
   const { ctx } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'export_claude')
+  const def = exportDef(ctx, 'claude')
   await assert.rejects(() => def.execute({ sessionId: 'no-such-session' }), /会话不存在/)
 })
 
@@ -2488,7 +2832,7 @@ test('export_claude 无 cwd（header 无且未提供）：抛错', async () => {
     mkEvent('assistant/message', 1, 1786000000000, { id: 'a1', role: 'assistant', content: [{ type: 'text', text: 'hello' }], source: { kind: 'model', provider: 'dsh' } }, { surfaceOp: 'append' }),
   ])
   apply(ctx)
-  const def = registeredDef(ctx, 'export_claude')
+  const def = exportDef(ctx, 'claude')
   await assert.rejects(() => def.execute({ sessionId: 'sess-nocwd' }), /cwd/)
 })
 
@@ -2496,7 +2840,7 @@ test('export_claude createIfAbsent：目标已存在（uuid 碰撞模拟）时�
   const tree = { 'D:\\demo\\proj\\sess-simple-001.jsonl': load('sess-simple-001.jsonl') }
   const { ctx } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
+  await chatDef(ctx, 'claude').execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
 
   const fixed = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
   const target = join(OUT, 'D--demo-proj', fixed + '.jsonl')
@@ -2516,7 +2860,7 @@ test('export_claude 注入会话：非人类 user/message 跳过并计数', asyn
     mkEvent('assistant/message', 2, 1786000000000, { id: 'a1', role: 'assistant', content: [{ type: 'text', text: '回答' }], source: { kind: 'model', provider: 'dsh' } }, { surfaceOp: 'append' }),
   ])
   apply(ctx)
-  const def = registeredDef(ctx, 'export_claude')
+  const def = exportDef(ctx, 'claude')
   const value = await def.execute({ sessionId: 'sess-inject', outputDir: OUT })
   assert.equal(value.mapping.skippedInjections, 1)
   assert.equal(value.recordCount, 4) // 注入不落记录
@@ -2533,7 +2877,7 @@ test('REQ-21 export_claude 降级报告：附件块跳过 + 注入跳过逐条�
     mkEvent('assistant/message', 1, 1786000000000, { id: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: '这是图' }, { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGVsbG8=' } }] }, source: { kind: 'model', provider: 'dsh' } }, { surfaceOp: 'append' }),
   ])
   apply(ctx)
-  const def = registeredDef(ctx, 'export_claude')
+  const def = exportDef(ctx, 'claude')
   const value = await def.execute({ sessionId: 'sess-degrade', outputDir: OUT })
   // image 块无法表达 → attachment-skipped 1 条；无注入/孤儿结果
   assert.deepEqual(value.degradations, [{ id: 'attachment-skipped', kind: 'attachmentSkipped', strategy: 'skip-placeholder', count: 1 }])
@@ -2551,7 +2895,7 @@ test('export_claude 中断会话：末尾补发空 tool_result，会话日志只
   ]
   await seedSession(persistence, 'sess-interrupted', { version: 0, id: 'sess-interrupted', createdAt: 1786000000000, cwd: 'D:\\demo\\proj' }, events)
   apply(ctx)
-  const def = registeredDef(ctx, 'export_claude')
+  const def = exportDef(ctx, 'claude')
   const value = await def.execute({ sessionId: 'sess-interrupted', outputDir: OUT })
   assert.equal(value.recordCount, 5) // 末尾补发 1 条
   assert.equal(value.mapping.toolResults, 1)
@@ -2608,7 +2952,6 @@ test('REQ-56 bundle 闭环：export_bundle 落盘 → restore_bundle 还原 0 sk
   const saved = p2.sessions.get(restored.sessionId)
   assert.ok(saved)
   assert.equal(saved.events.at(-1).type, 'turn/end')
-  // 幂等：重复还原 already-imported
   const again = await rst.execute({ path: bundlePath })
   assert.equal(again.status, 'already-imported')
   assert.equal(p2.sessions.size, 1)
@@ -2712,7 +3055,7 @@ test('REQ-23 export_codex / export_kimi：落盘 + 可再导入 + 降级报告 +
     mkEvent('turn/end', 5, 1786000000000, { turn: 1, reason: { kind: 'completed' } }),
   ])
   apply(ctx)
-  const codexDef = registeredDef(ctx, 'export_codex')
+  const codexDef = exportDef(ctx, 'codex')
   const cwdPath = 'C:\\exports\\x.rollout.jsonl'
   const codexOut = await codexDef.execute({ sessionId: 'sess-matrix-001', path: cwdPath })
   assert.equal(codexOut.recordCount, 5) // session_meta + user + assistant + function_call + function_call_output
@@ -2720,7 +3063,7 @@ test('REQ-23 export_codex / export_kimi：落盘 + 可再导入 + 降级报告 +
   assert.equal(codexOut.toolResults, 1)
   assert.deepEqual(validateJsonSchemaValue(codexDef.output.schema, codexOut), [])
 
-  const kimiDef = registeredDef(ctx, 'export_kimi')
+  const kimiDef = exportDef(ctx, 'kimi')
   const kimiPath = 'C:\\exports\\y.wire.jsonl'
   const kimiOut = await kimiDef.execute({ sessionId: 'sess-matrix-001', path: kimiPath })
   assert.equal(kimiOut.recordCount, 7) // metadata + TurnBegin + StepBegin + TextPart + ToolCall + ToolResult + TurnEnd
@@ -2730,12 +3073,12 @@ test('REQ-23 export_codex / export_kimi：落盘 + 可再导入 + 降级报告 +
   // 双向闭环：导出文件再经对应 import_* 导入（新 ctx 模拟另一侧）
   const { ctx: ctx2, persistence: p2 } = makeCtx({ [cwdPath]: writes[0].content, [kimiPath]: writes[1].content })
   apply(ctx2)
-  const impCodex = registeredDef(ctx2, 'import_codex')
+  const impCodex = chatDef(ctx2, 'codex')
   const codexBack = await impCodex.execute({ path: cwdPath })
   assert.equal(codexBack.mode, 'single')
   assert.equal(codexBack.status, 'imported')
   assert.equal(codexBack.toolCalls, 1)
-  const impKimi = registeredDef(ctx2, 'import_kimi')
+  const impKimi = chatDef(ctx2, 'kimi')
   const kimiBack = await impKimi.execute({ path: kimiPath })
   assert.equal(kimiBack.mode, 'single')
   assert.equal(kimiBack.status, 'imported')
@@ -2810,7 +3153,7 @@ test('REQ-43 agents.create 路径：setup 挂 preset scope、agentOptions 绑定
   const simple = load('sess-simple-001.jsonl')
   const { ctx, persistence, attached } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple }, { services })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_claude')
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
   assert.equal(value.status, 'imported')
   // agents.create 被调用：meta/seed/agentOptions/setup 齐备
@@ -2831,7 +3174,7 @@ test('REQ-43 agents.create 路径：setup 挂 preset scope、agentOptions 绑定
   // 无 agents 服务 → 回退 sessionPersistence.create+append（旧路径，行为不变）
   const { ctx: ctx2, persistence: p2 } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple })
   apply(ctx2)
-  const def2 = registeredDef(ctx2, 'import_claude')
+  const def2 = chatDef(ctx2, 'claude')
   await def2.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
   assert.ok(p2.sessions.has('import-sess-simple-001'))
 })
@@ -2861,7 +3204,7 @@ test('REQ-43 补录预设：agentPresets.resolve 返回默认 preset 时写进 m
   const simple = load('sess-simple-001.jsonl')
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple }, { services })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_claude')
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
   assert.equal(value.status, 'imported')
   assert.equal(agentsCalls.length, 1)
@@ -2889,7 +3232,7 @@ test('REQ-43 补录预设：agentPresets.resolve 抛错/缺 default 时保持现
   const simple = load('sess-simple-001.jsonl')
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple }, { services })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_claude')
+  const def = chatDef(ctx, 'claude')
   await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
   assert.equal(agentsCalls.length, 1)
   assert.equal(agentsCalls[0].meta.agentPreset, undefined)
@@ -2905,7 +3248,7 @@ test('REQ-43 agents.create 失败（无 cwd 等）→ 回退 sessionPersistence 
   const simple = load('sess-simple-001.jsonl')
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple }, { services })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_claude')
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
   assert.equal(value.status, 'imported')
   // 回退路径已落盘
@@ -2922,7 +3265,7 @@ test('REQ-39 沙箱防护：transcript cwd = 主目录 → 归组回退源文件
   ].join('\n')
   const { ctx, attached } = makeCtx({ 'D:\\demo\\proj\\sess-home-001.jsonl': jsonl })
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: 'D:\\demo\\proj\\sess-home-001.jsonl' })
+  await chatDef(ctx, 'claude').execute({ path: 'D:\\demo\\proj\\sess-home-001.jsonl' })
   // 归组落在源文件目录，不是主目录（跨平台：Linux 下 dirname 为 '.'，Windows 为 D:\demo\proj）
   assert.equal(attached.length, 1)
   assert.equal(attached[0].ws, dirname('D:\\demo\\proj\\sess-home-001.jsonl'))
@@ -2942,7 +3285,7 @@ test('REQ-39 Claude 权威映射：转录无 cwd → ~/.claude.json projects 命
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_claude')
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: root + '\\sess-nocwd-001.jsonl' })
   assert.equal(value.status, 'imported')
   // meta.cwd = 权威映射结果（真实路径），非 slug 目录名
@@ -2975,7 +3318,7 @@ test('REQ-22 import_reasonix：同目录 <stem>.events.jsonl 自动合并，结�
   }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx, 'import_reasonix')
+  const def = chatDef(ctx, 'reasonix')
   const value = await def.execute({ path: dir })
   assert.equal(value.mode, 'batch')
   assert.equal(value.imported, 2)
@@ -3001,7 +3344,7 @@ test('REQ-22 import_claude compacted 参数：摘要导入只落尾部 + compact
   ].join('\n')
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\claude\\projects\\p\\sess-comp-002.jsonl': lines })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_claude')
+  const def = chatDef(ctx, 'claude')
   // 参数进 schema
   assert.equal(def.parameters.properties.compacted.type, 'boolean')
   const value = await def.execute({ path: 'D:\\demo\\claude\\projects\\p\\sess-comp-002.jsonl', compacted: true })
@@ -3043,7 +3386,7 @@ test('REQ-51 import_hermes lineage:tail：只导叶子链尾；父会话（含�
   const dbPath = makeHermesLineageDb()
   const { ctx, persistence } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_hermes')
+  const def = chatDef(ctx, 'hermes')
   // lineage 参数进 schema
   assert.equal(def.parameters.properties.lineage.enum[0], 'tail')
 
@@ -3069,8 +3412,22 @@ test('REQ-51 import_hermes lineage:tail：只导叶子链尾；父会话（含�
 })
 
 // 辅助：从 ctx.tools 按名字取回定义（apply 内部调用 register）
-function registeredDef(ctx, toolName = 'import_claude') {
+function registeredDef(ctx, toolName) {
   return ctx.tools.registered(toolName)
+}
+
+// 辅助：import_chat 分发器定义——execute 时注入 format（19 种来源收敛为单工具
+// 后的测试形态；等价于旧 import_<format> 工具的调用方式）
+function chatDef(ctx, format) {
+  const tool = registeredDef(ctx, 'import_chat')
+  return { ...tool, execute: (args) => tool.execute({ format, ...args }) }
+}
+
+// 辅助：export_chat 三合一定义——execute 时注入 format（claude/codex/kimi 收敛为
+// 单工具后的测试形态；等价于旧 export_claude / export_codex / export_kimi 调用）
+function exportDef(ctx, format) {
+  const tool = registeredDef(ctx, 'export_chat')
+  return { ...tool, execute: (args) => tool.execute({ format, ...args }) }
 }
 
 // ---- REQ-36 反向同步（增量写回） ----
@@ -3130,7 +3487,7 @@ test('REQ-36 快乐路径：导入 → DSH 续聊完整轮 → sync 写回源文
   const tree = { [src]: claudeJsonl(1) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const imp = registeredDef(ctx, 'import_claude')
+  const imp = chatDef(ctx, 'claude')
   const imported = await imp.execute({ path: src })
   assert.equal(imported.status, 'imported')
   assert.equal(imported.sessionId, 'import-sync-sess-001')
@@ -3193,7 +3550,7 @@ test('REQ-36 半截轮不写：半开尾轮丢弃（incompleteFinalTurn），闭
   const tree = { [src]: claudeJsonl(1) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: src })
+  await chatDef(ctx, 'claude').execute({ path: src })
 
   // 半开轮（无 step/end + turn/end）
   await appendTurn(persistence, 'import-sync-sess-001', 2, '半截提问', { halfOpen: true })
@@ -3222,7 +3579,7 @@ test('REQ-36 守卫：源文件被外部修改（size/version 变化）→ skipp
   const tree = { [src]: claudeJsonl(1) }
   const { ctx } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: src })
+  await chatDef(ctx, 'claude').execute({ path: src })
   // 首同步：建立基线水印（no-new-turns，桥武装）
   const arm = await syncClaudeSession(ctx, { sessionId: 'import-sync-sess-001' }, { registryDir: resolveRegistryDir() })
   assert.equal(arm.status, 'no-new-turns')
@@ -3232,7 +3589,7 @@ test('REQ-36 守卫：源文件被外部修改（size/version 变化）→ skipp
   const v = await syncClaudeSession(ctx, { sessionId: 'import-sync-sess-001' }, { registryDir: resolveRegistryDir() })
   assert.equal(v.status, 'skipped')
   assert.equal(v.conflictDetected, 'source-modified-externally')
-  assert.equal(v.writeback.lastWrittenSeq, 7)
+  assert.equal(v.writeback.lastWrittenSeq, 8) // 导入记录事件数（含 session/title，无标记）
 })
 
 test('REQ-36 守卫：源文件缩小 → skipped + sourceShrunk', async () => {
@@ -3240,7 +3597,7 @@ test('REQ-36 守卫：源文件缩小 → skipped + sourceShrunk', async () => {
   const tree = { [src]: claudeJsonl(2) }
   const { ctx } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: src })
+  await chatDef(ctx, 'claude').execute({ path: src })
   const arm = await syncClaudeSession(ctx, { sessionId: 'import-sync-sess-001' }, { registryDir: resolveRegistryDir() })
   assert.equal(arm.status, 'no-new-turns')
 
@@ -3256,7 +3613,7 @@ test('REQ-36 守卫：tail-mismatch（同尺寸同版本改链尾）→ 跳过�
   // 钉住版本：模拟「内容变了但 fs 版本不变」的外部修改（真实 fs version 是 opaque id）
   const { ctx, persistence } = makeCtx(tree, { versions: { [src]: 'v-pinned' } })
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: src })
+  await chatDef(ctx, 'claude').execute({ path: src })
   const arm = await syncClaudeSession(ctx, { sessionId: 'import-sync-sess-001' }, { registryDir: resolveRegistryDir() })
   assert.equal(arm.status, 'no-new-turns')
 
@@ -3285,7 +3642,7 @@ test('REQ-36 CAS 竞态：写入瞬间版本失配 → write-version-mismatch，
   const tree = { [src]: claudeJsonl(1) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: src })
+  await chatDef(ctx, 'claude').execute({ path: src })
   const arm = await syncClaudeSession(ctx, { sessionId: 'import-sync-sess-001' }, { registryDir: resolveRegistryDir() })
   assert.equal(arm.status, 'no-new-turns')
   await appendTurn(persistence, 'import-sync-sess-001', 2, '竞态提问')
@@ -3303,7 +3660,7 @@ test('REQ-36 CAS 竞态：写入瞬间版本失配 → write-version-mismatch，
   assert.equal(v.conflictDetected, 'write-version-mismatch')
   assert.ok(!tree[src].includes('竞态提问')) // 尾行未写入
   const reg = await loadImports(resolveRegistryDir())
-  assert.equal(reg.imports[src].writeback.lastWrittenSeq, 7) // 水印未推进
+  assert.equal(reg.imports[src].writeback.lastWrittenSeq, 8) // 水印未推进（导入记录事件数）
 })
 
 test('REQ-36 预检失败回滚：目标文件不符合严格布局（无 mode 头）→ 写后回滚，水印不推进', async () => {
@@ -3312,7 +3669,7 @@ test('REQ-36 预检失败回滚：目标文件不符合严格布局（无 mode �
   const tree = { [src]: load('sess-simple-001.jsonl') }
   const { ctx, persistence, writes } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: src })
+  await chatDef(ctx, 'claude').execute({ path: src })
   const arm = await syncClaudeSession(ctx, { sessionId: 'import-sess-simple-001' }, { registryDir: resolveRegistryDir() })
   assert.equal(arm.status, 'no-new-turns')
   await appendTurn(persistence, 'import-sess-simple-001', 2, '预检失败提问')
@@ -3326,7 +3683,7 @@ test('REQ-36 预检失败回滚：目标文件不符合严格布局（无 mode �
   assert.equal(tree[src], before) // 回滚：文件恢复为写前内容
   assert.equal(writes.length, wCount + 2) // 前向写 + 回滚写
   const reg = await loadImports(resolveRegistryDir())
-  assert.equal(reg.imports[src].writeback.lastWrittenSeq, 7) // 水印未推进
+  assert.equal(reg.imports[src].writeback.lastWrittenSeq, 8) // 水印未推进（导入记录事件数）
 })
 
 test('REQ-36 写回后重导幂等：sync 后 import_claude → already-imported 无重复 append', async () => {
@@ -3334,7 +3691,7 @@ test('REQ-36 写回后重导幂等：sync 后 import_claude → already-imported
   const tree = { [src]: claudeJsonl(1) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  const imp = registeredDef(ctx, 'import_claude')
+  const imp = chatDef(ctx, 'claude')
   await imp.execute({ path: src })
   await appendTurn(persistence, 'import-sync-sess-001', 2, '续聊')
   const sync = await syncClaudeSession(ctx, { sessionId: 'import-sync-sess-001' }, { registryDir: resolveRegistryDir() })
@@ -3362,7 +3719,7 @@ test('REQ-36 多会话源：registry kind=multi → 报错暂不支持写回', a
   const tree = { 'D:\\demo\\chatgpt\\conversations.json': load('chatgpt-export.json') }
   const { ctx } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_chatgpt').execute({ path: 'D:\\demo\\chatgpt\\conversations.json' })
+  await chatDef(ctx, 'chatgpt').execute({ path: 'D:\\demo\\chatgpt\\conversations.json' })
   await assert.rejects(() => syncClaudeSession(ctx, { sessionId: 'import-conv-001' }, { registryDir: resolveRegistryDir() }), /多会话源/)
 })
 
@@ -3371,10 +3728,10 @@ test('REQ-36 copy target：export_claude 落 mapping → sync 写回副本；导
   const tree = { [src]: claudeJsonl(1) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: src })
+  await chatDef(ctx, 'claude').execute({ path: src })
   // DSH 续聊一轮后再导出（导出副本已含该轮）
   await appendTurn(persistence, 'import-sync-sess-001', 2, '导出前续聊')
-  const exp = await registeredDef(ctx, 'export_claude').execute({ sessionId: 'import-sync-sess-001', outputDir: OUT })
+  const exp = await exportDef(ctx, 'claude').execute({ sessionId: 'import-sync-sess-001', outputDir: OUT })
   const copyPath = exp.filePath
   const copyBefore = tree[copyPath]
   // export 后 registry 记录带 exports 映射（mapping 落库）
@@ -3407,14 +3764,14 @@ test('REQ-36 dryRun：完整计算 + 预检但不写盘、不更新 registry', a
   const tree = { [src]: claudeJsonl(1) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: src })
+  await chatDef(ctx, 'claude').execute({ path: src })
   await appendTurn(persistence, 'import-sync-sess-001', 2, 'dry 续聊')
   const before = tree[src]
   const v = await syncClaudeSession(ctx, { sessionId: 'import-sync-sess-001', dryRun: true }, { registryDir: resolveRegistryDir() })
   assert.equal(v.status, 'synced')
   assert.equal(v.dryRun, true)
   assert.equal(v.appendedTurns, 1)
-  assert.equal(v.writeback.lastWrittenSeq, 13) // 将写入的水印（未持久化）
+  assert.equal(v.writeback.lastWrittenSeq, 14) // 将写入的水印（未持久化；含 session/title）
   assert.equal(tree[src], before) // 不写盘
   const reg = await loadImports(resolveRegistryDir())
   assert.equal(reg.imports[src].writeback, undefined) // 不更新 registry
@@ -3425,7 +3782,7 @@ test('REQ-36 源文件缺失：skipped + source-missing', async () => {
   const tree = { [src]: claudeJsonl(1) }
   const { ctx } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: src })
+  await chatDef(ctx, 'claude').execute({ path: src })
   delete tree[src]
   const v = await syncClaudeSession(ctx, { sessionId: 'import-sync-sess-001' }, { registryDir: resolveRegistryDir() })
   assert.equal(v.status, 'skipped')
@@ -3437,7 +3794,7 @@ test('REQ-36 storedShrunk：DSH 日志比水印短 → 跳过', async () => {
   const tree = { [src]: claudeJsonl(1) }
   const { ctx } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: src })
+  await chatDef(ctx, 'claude').execute({ path: src })
   // 直接写 registry：伪造超前水印（lastSize/version 与 stat 一致、prevUuid 匹配 → 三闸通过）
   const content = claudeJsonl(1)
   const stat = { size: content.length, version: contentVersion(content) }
@@ -3465,7 +3822,7 @@ test('REQ-36 工具入口：sync_to_claude execute 走 syncClaudeSession（schem
   const tree = { [src]: claudeJsonl(1) }
   const { ctx, persistence } = makeCtx(tree)
   apply(ctx)
-  await registeredDef(ctx, 'import_claude').execute({ path: src })
+  await chatDef(ctx, 'claude').execute({ path: src })
   await appendTurn(persistence, 'import-sync-sess-001', 2, '工具入口')
   const def = registeredDef(ctx, 'sync_to_claude')
   const value = await def.execute({ sessionId: 'import-sync-sess-001', dryRun: true })
@@ -3496,7 +3853,7 @@ test('REQ-37 超长会话导入：预算环境变量覆盖 → 三层保护生�
     const tree = { 'D:\\demo\\proj\\sess-huge-001.jsonl': hugeClaudeTurns(80, { giantAt: 5 }) }
     const { ctx, persistence } = makeCtx(tree)
     apply(ctx)
-    const def = registeredDef(ctx)
+    const def = chatDef(ctx, 'claude')
     const value = await def.execute({ path: 'D:\\demo\\proj\\sess-huge-001.jsonl' })
     assert.equal(value.mode, 'single')
     assert.equal(value.status, 'imported')
@@ -3520,7 +3877,7 @@ test('REQ-37 超长会话导入：预算环境变量覆盖 → 三层保护生�
       .map((b) => b.text)
     assert.ok(!texts.some((t) => t.startsWith('回答' + '字'.repeat(1500))))
     // 开头锚点（最早 3 条 user 文本）保留
-    const userTexts = saved.events.filter((e) => e.type === 'user/message').map((e) => e.data.content[0].text)
+    const userTexts = saved.events.filter((e) => e.type === 'user/message' && e.data.source.kind === 'user').map((e) => e.data.content[0].text)
     assert.ok(userTexts[0].startsWith('问题1'))
     assert.ok(userTexts[1].startsWith('问题2'))
     assert.ok(userTexts[2].startsWith('问题3'))
@@ -3545,7 +3902,7 @@ test('REQ-37 无 provider 配置：走静态默认预算 550k，不报错、小�
   const simple = load('sess-simple-001.jsonl')
   const { ctx } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple })
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
   assert.equal(value.status, 'imported')
   assert.equal(value.trimmed, undefined) // 保护未生效 → 不上报
@@ -3560,7 +3917,7 @@ test('REQ-37 工具参数 budget 覆盖环境变量（优先级最高）', async
     const simple = load('sess-simple-001.jsonl')
     const { ctx } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple })
     apply(ctx)
-    const def = registeredDef(ctx)
+    const def = chatDef(ctx, 'claude')
     const value = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl', budget: 300000 })
     assert.equal(value.status, 'imported')
     const reg = await loadImports(resolveRegistryDir())
@@ -3587,7 +3944,7 @@ test('REQ-37 动态预算：agentDefaultModel + llm 解析模型窗口（窗口 
   const simple = load('sess-simple-001.jsonl')
   const { ctx } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple }, { services })
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
   assert.equal(value.status, 'imported')
   assert.deepEqual(calls, [['deepseek', 'deepseek-chat']])
@@ -3609,7 +3966,7 @@ test('REQ-37 动态解析失败（服务抛错）→ 回退静态默认不报错
   }
   const { ctx } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple }, { services })
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
   assert.equal(value.status, 'imported')
   const reg = await loadImports(resolveRegistryDir())
@@ -3620,7 +3977,7 @@ test('REQ-37 预算变化：文件未变但预算变 → 跳过并上报 budgetC
   const simple = load('sess-simple-001.jsonl')
   const { ctx } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple })
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   process.env.DSH_IMPORT_CONTEXT_BUDGET = '500000'
   try {
     const first = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
@@ -3658,7 +4015,7 @@ test('REQ-37 目录批量导入：逐文件 trimmed 进 results（schema 校验�
     }
     const { ctx, persistence } = makeCtx(tree)
     apply(ctx)
-    const def = registeredDef(ctx)
+    const def = chatDef(ctx, 'claude')
     const value = await def.execute({ path: 'D:\\demo\\proj' })
     assert.equal(value.mode, 'batch')
     assert.equal(value.imported, 2)
@@ -3684,7 +4041,7 @@ test('REQ-17 单文件 preview：返回预览清单（标题/cwd/时间/规模�
   const simple = load('sess-simple-001.jsonl')
   const { ctx, persistence, attached, reads } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple })
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl', preview: true })
 
   assert.equal(value.mode, 'single')
@@ -3715,7 +4072,7 @@ test('REQ-17 dryRun 别名：与 preview 同语义（单文件）', async () => 
   const simple = load('sess-simple-001.jsonl')
   const { ctx, persistence, attached } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple })
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl', dryRun: true })
   assert.equal(value.mode, 'single')
   assert.equal(value.preview, true)
@@ -3735,7 +4092,7 @@ test('REQ-17 目录 preview：批量形态（total/results 同骨架）、逐文
   }
   const { ctx, persistence, attached } = makeCtx(tree)
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj', preview: true })
 
   assert.equal(value.mode, 'batch')
@@ -3776,7 +4133,7 @@ test('REQ-17 目录 preview：批量形态（total/results 同骨架）、逐文
 test('REQ-17 辅助 transcript 单文件 preview：跳过明细（skipReason）', async () => {
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\proj\\agent-abc123.jsonl': load('sess-simple-001.jsonl') })
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const value = await def.execute({ path: 'D:\\demo\\proj\\agent-abc123.jsonl', preview: true })
   assert.equal(value.mode, 'single')
   assert.equal(value.preview, true)
@@ -3791,7 +4148,7 @@ test('REQ-17 辅助 transcript 单文件 preview：跳过明细（skipReason）'
 test('REQ-17 import_chatgpt preview：单 conversations.json 逐会话预览（恒批量）', async () => {
   const { ctx, persistence, attached } = makeCtx({ 'D:\\demo\\chatgpt\\conversations.json': load('chatgpt-export.json') })
   apply(ctx)
-  const def = registeredDef(ctx, 'import_chatgpt')
+  const def = chatDef(ctx, 'chatgpt')
   const value = await def.execute({ path: 'D:\\demo\\chatgpt\\conversations.json', preview: true })
 
   assert.equal(value.mode, 'batch') // 单文件也恒批量
@@ -3813,7 +4170,7 @@ test('REQ-17 import_opencode preview：SQLite 库逐会话预览（恒批量、�
   const dbPath = makeOpencodeDb(opencodeTestSessions())
   const { ctx, persistence, attached } = makeCtx({})
   apply(ctx)
-  const def = registeredDef(ctx, 'import_opencode')
+  const def = chatDef(ctx, 'opencode')
   const value = await def.execute({ path: dbPath, preview: true })
 
   assert.equal(value.mode, 'batch')
@@ -3834,7 +4191,7 @@ test('REQ-17 已导入文件 preview：不 consult registry 短路径，仍报�
   const simple = load('sess-simple-001.jsonl')
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple })
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' }) // 正式导入（建 registry 记录）
   const value = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl', preview: true })
   assert.equal(value.preview, true)
@@ -3849,7 +4206,7 @@ test('REQ-17 预览 → 正式导入：去掉 preview 后字段口径一致、�
   const simple = load('sess-simple-001.jsonl')
   const { ctx, persistence } = makeCtx({ 'D:\\demo\\proj\\sess-simple-001.jsonl': simple })
   apply(ctx)
-  const def = registeredDef(ctx)
+  const def = chatDef(ctx, 'claude')
   const preview = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl', preview: true })
   const real = await def.execute({ path: 'D:\\demo\\proj\\sess-simple-001.jsonl' })
 
@@ -3866,7 +4223,7 @@ test('REQ-17 预览 → 正式导入：去掉 preview 后字段口径一致、�
 
 // ---- REQ-41 被动会话发现（Browser 面板数据源路由） ----
 
-test('REQ-41 apply 注册 webServer 路由（POST /api-import/sessions + /api-import/import，kind exact），工具计数不变（20 个）', () => {
+test('REQ-41 apply 注册 webServer 路由（POST /api-import/sessions + /api-import/import，kind exact），工具计数不变（13 个）', () => {
   const { ctx, webRoutes, registered } = makeCtx({})
   apply(ctx)
   const sessions = webRoutes.find((r) => r.path === '/api-import/sessions')
@@ -3879,16 +4236,16 @@ test('REQ-41 apply 注册 webServer 路由（POST /api-import/sessions + /api-im
   assert.equal(imp.kind, 'exact')
   assert.equal(typeof sessions.handler, 'function')
   assert.equal(typeof imp.handler, 'function')
-  // 只加路由，不加工具：18 导入 + import_agents + doctor + import_mcp + import_settings + scan/export×3/sync/list/retract + bundle 导出/还原 + verify = 32，注册数不变
-  assert.equal(registered.length, 32)
+  // 只加路由，不加工具：import_chat 分流 18 来源 + import_agents + doctor + import_mcp + import_settings + scan/export_chat/sync/list/retract + bundle 导出/还原 + verify = 13，注册数不变
+  assert.equal(registered.length, 13)
 })
 
-test('REQ-41 webServer 可选：headless（无 webServer）apply 不抛错、32 工具照常注册、无路由', () => {
+test('REQ-41 webServer 可选：headless（无 webServer）apply 不抛错、13 工具照常注册、无路由', () => {
   const { ctx, webRoutes, registered } = makeCtx({}, { noWebServer: true })
   apply(ctx)
   // 缺 webServer 只是不注册面板路由，导入工具不受影响（CI headless 冒烟场景）
   assert.equal(webRoutes.length, 0)
-  assert.equal(registered.length, 32)
+  assert.equal(registered.length, 13)
 })
 
 test('REQ-41 /api-import/sessions handler：合成夹具经 discoverSessions 返回会话、未知来源 400', async () => {
@@ -4029,6 +4386,186 @@ test('REQ-41 /api-import/sessions handler：分页（offset/limit + total）+ �
   assert.equal(all.data.limit, 3)
 })
 
+test('REQ-41 /api-import/sessions 流式：后台扫描 + after 游标轮询（增量去重、epoch 换键）', async () => {
+  const root = 'D:\\demo\\claude\\projects'
+  const tree = {
+    [root]: 'dir',
+    [root + '\\proj-a']: 'dir',
+    [root + '\\proj-a\\sess-aaa.jsonl']: '{"sessionId":"sess-aaa","type":"user","cwd":"D:\\\\demo\\\\proj-a","message":{"role":"user","content":"第一个问题"}}\n{"sessionId":"sess-aaa","type":"assistant","message":{"role":"assistant","content":"ok"}}',
+    [root + '\\proj-b']: 'dir',
+    [root + '\\proj-b\\sess-bbb.jsonl']: '{"sessionId":"sess-bbb","type":"user","cwd":"D:\\\\demo\\\\proj-b","message":{"role":"user","content":"第二个问题"}}\n{"sessionId":"sess-bbb","type":"assistant","message":{"role":"assistant","content":"ok"}}',
+  }
+  const { ctx, webRoutes } = makeCtx(tree)
+  apply(ctx)
+  const route = webRoutes.find((r) => r.path === '/api-import/sessions')
+  const invoke = async (body) => {
+    const req = { async *[Symbol.asyncIterator]() { yield JSON.stringify(body) } }
+    const res = { status: null, headers: null, body: null, writeHead(s, h) { this.status = s; this.headers = h }, end(b) { this.body = b } }
+    await route.handler(req, res)
+    return { res, data: JSON.parse(res.body) }
+  }
+
+  // 首请求创建后台扫描并立即返回当前增量（done 前按 cursor 轮询）
+  const p0 = await invoke({ source: 'claude-code', path: root, epoch: 1, after: 0 })
+  assert.equal(p0.res.status, 200)
+  assert.equal(p0.data.ok, true)
+  assert.equal(typeof p0.data.cursor, 'number')
+  assert.equal(p0.data.offset, undefined) // 流式响应不带旧契约分页字段
+
+  // 客户端按 cursor 轮询直至 done：增量按 seq 去重，最终集合 = 全量发现
+  const all = []
+  let after = 0
+  let guard = 0
+  for (;;) {
+    const r = await invoke({ source: 'claude-code', path: root, epoch: 1, after })
+    assert.equal(r.data.ok, true)
+    for (const s of r.data.sessions) {
+      assert.ok(!all.includes(s.sessionId), '游标增量不应重复: ' + s.sessionId)
+      all.push(s.sessionId)
+    }
+    after = r.data.cursor
+    if (r.data.done === true) {
+      assert.equal(r.data.total, 2)
+      break
+    }
+    // 后台扫描在事件循环里异步推进：轮询需让出（生产端客户端按 ~250ms 轮询）
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    assert.ok(guard++ < 200, '扫描未在 200 次轮询内完成')
+  }
+  assert.deepEqual([...all].sort(), ['sess-aaa', 'sess-bbb'])
+
+  // epoch 变化 → 新扫描键（刷新语义）：重新产出同一集合
+  const again = await invoke({ source: 'claude-code', path: root, epoch: 2, after: 0 })
+  assert.equal(again.data.ok, true)
+  if (again.data.done === true) {
+    assert.deepEqual(again.data.sessions.map((s) => s.sessionId).sort(), ['sess-aaa', 'sess-bbb'])
+  }
+
+  // query 过滤透传（流式模式同样作用于产出路径）
+  const q = await invoke({ source: 'claude-code', path: root, query: '第二个', epoch: 3, after: 0 })
+  assert.equal(q.data.ok, true)
+  if (q.data.done === true) {
+    assert.deepEqual(q.data.sessions.map((s) => s.sessionId), ['sess-bbb'])
+    assert.equal(q.data.total, 1)
+  }
+
+  // 未知来源 → 400（流式模式同样先校验）
+  const bad = await invoke({ source: 'nope', epoch: 1, after: 0 })
+  assert.equal(bad.res.status, 400)
+  assert.equal(bad.data.ok, false)
+})
+
+test('REQ-41 /api-import/sessions 流式：超大库按 STREAM_CHUNK 分块交付、游标收敛无重复', async () => {
+  const root = 'D:\\demo\\claude\\projects-big'
+  const N = 2100
+  const tree = { [root]: 'dir', [root + '\\proj-a']: 'dir' }
+  for (let i = 0; i < N; i++) {
+    const p = root + '\\proj-a\\sess-' + i + '.jsonl'
+    tree[p] = '{"sessionId":"sess-' + i + '","type":"user","cwd":"D:\\\\demo\\\\proj-a","message":{"role":"user","content":"问题' + i + '"}}\n' +
+      '{"sessionId":"sess-' + i + '","type":"assistant","message":{"role":"assistant","content":"ok"}}'
+  }
+  const { ctx, webRoutes } = makeCtx(tree)
+  apply(ctx)
+  const route = webRoutes.find((r) => r.path === '/api-import/sessions')
+  const invoke = async (body) => {
+    const req = { async *[Symbol.asyncIterator]() { yield JSON.stringify(body) } }
+    const res = { status: null, headers: null, body: null, writeHead(s, h) { this.status = s; this.headers = h }, end(b) { this.body = b } }
+    await route.handler(req, res)
+    return { res, data: JSON.parse(res.body) }
+  }
+
+  // 轮询收敛：单响应长度有界（≤500）、游标单调、无重复、最终全量交付
+  const all = []
+  let after = 0
+  let guard = 0
+  for (;;) {
+    const r = await invoke({ source: 'claude-code', path: root, epoch: 9, after })
+    assert.equal(r.data.ok, true)
+    assert.ok(r.data.sessions.length <= 500, '单响应超过分块上限: ' + r.data.sessions.length)
+    for (const s of r.data.sessions) {
+      assert.ok(!all.includes(s.sessionId), '游标增量不应重复: ' + s.sessionId)
+      all.push(s.sessionId)
+    }
+    assert.ok(r.data.cursor >= after, '游标不应回退')
+    after = r.data.cursor
+    if (r.data.done === true) break
+    await new Promise((resolve) => setTimeout(resolve, 3))
+    assert.ok(guard++ < 500, '未在 500 次轮询内收敛')
+  }
+  assert.equal(all.length, N)
+  assert.equal(new Set(all).size, N)
+  assert.equal(after, N)
+})
+
+test('REQ-41 /api-import/prefs：settings 缺席回退默认；在场时读/写走 fenced 路由（revision 冲突保护）', async () => {
+  const invoke = async (route, body) => {
+    const req = { async *[Symbol.asyncIterator]() { yield JSON.stringify(body) } }
+    const res = { status: null, headers: null, body: null, writeHead(s, h) { this.status = s; this.headers = h }, end(b) { this.body = b } }
+    await route.handler(req, res)
+    return { res, data: JSON.parse(res.body) }
+  }
+
+  // settings 服务缺席（默认 makeCtx）：读回默认 + available:false；写原样返回不抛
+  const { ctx, webRoutes } = makeCtx({})
+  apply(ctx)
+  const route = webRoutes.find((r) => r.path === '/api-import/prefs')
+  assert.ok(route, '面板注册了 /api-import/prefs 路由')
+  const r0 = await invoke(route, {})
+  assert.equal(r0.res.status, 200)
+  assert.equal(r0.data.ok, true)
+  assert.equal(r0.data.available, false)
+  assert.deepEqual(r0.data.value, { importSystemPrompt: true, injectTools: true })
+  const w0 = await invoke(route, { importSystemPrompt: true })
+  assert.equal(w0.data.ok, true)
+  assert.equal(w0.data.available, false)
+
+  // settings 在场：describe 读 value+revision，update 携带 expectedRevision
+  const calls = []
+  const settingsStub = {
+    register(ns, schema) { return { ns, schema } },
+    describe(opts) {
+      assert.equal(opts.redactSecrets, true)
+      return [{ ns: 'chat-import', value: { importSystemPrompt: false, injectTools: true }, revision: 7 }]
+    },
+    async update(ns, patch, expectedRevision) { calls.push({ ns, patch, expectedRevision }) },
+    get(_ns) { return { importSystemPrompt: false, injectTools: true } },
+  }
+  const { ctx: ctx2, webRoutes: routes2 } = makeCtx({}, { services: { settings: settingsStub } })
+  apply(ctx2)
+  const route2 = routes2.find((r) => r.path === '/api-import/prefs')
+  const r = await invoke(route2, {})
+  assert.equal(r.data.ok, true)
+  assert.equal(r.data.available, true)
+  assert.equal(r.data.revision, 7)
+  assert.deepEqual(r.data.value, { importSystemPrompt: false, injectTools: true })
+  const w = await invoke(route2, { importSystemPrompt: true, revision: 7 })
+  assert.equal(w.data.ok, true)
+  assert.deepEqual(calls, [{ ns: 'chat-import', patch: { importSystemPrompt: true }, expectedRevision: 7 }])
+  // injectTools 写入同样走 fenced 路由（第二个开关共用同一偏好命名空间）
+  const w2 = await invoke(route2, { injectTools: false, revision: 7 })
+  assert.equal(w2.data.ok, true)
+  assert.deepEqual(calls, [
+    { ns: 'chat-import', patch: { importSystemPrompt: true }, expectedRevision: 7 },
+    { ns: 'chat-import', patch: { injectTools: false }, expectedRevision: 7 },
+  ])
+
+  // update 抛冲突 → ok:false + code: settings-conflict（客户端据此重读）
+  const conflictStub = {
+    ...settingsStub,
+    async update() {
+      const e = new Error('settings namespace "chat-import" changed since it was read (expected 7, now 8)')
+      e.name = 'SettingsConflictError'
+      throw e
+    },
+  }
+  const { ctx: ctx3, webRoutes: routes3 } = makeCtx({}, { services: { settings: conflictStub } })
+  apply(ctx3)
+  const route3 = routes3.find((r) => r.path === '/api-import/prefs')
+  const wc = await invoke(route3, { importSystemPrompt: true, revision: 7 })
+  assert.equal(wc.data.ok, false)
+  assert.equal(wc.data.code, 'settings-conflict')
+})
+
 test('REQ-55 面板发现 + scan_discover：归档目标 importStatus=archived（可重导），未归档导入仍 imported', async () => {
   const root = 'D:\\demo\\claude\\projects'
   const file = root + '\\proj-a\\sess-aaa.jsonl'
@@ -4039,7 +4576,7 @@ test('REQ-55 面板发现 + scan_discover：归档目标 importStatus=archived�
   }
   const { ctx, webRoutes } = makeCtx(tree)
   apply(ctx)
-  const imp = registeredDef(ctx)
+  const imp = chatDef(ctx, 'claude')
   await imp.execute({ path: file })
   const wr = ctx.get('workspaceRegistry')
   await wr.archiveSession('import-sess-aaa')
